@@ -9,21 +9,66 @@
  * Message shape (top to bottom):
  *   1. header block - date-stamped title, e.g. "☀️ Morning Brief — Friday, August 14"
  *   2. (optional) priority_recap section, bold/italic
- *   3. for each entry in `sections`: a bold section-title line, then one
- *      section block per item (item.text as markdown; if item.link is set,
- *      it's attached as a `button`-type accessory that deep-links out via
- *      `url` - Slack opens these directly, no interactivity round-trip, so
- *      they work even while this server is cold/asleep). A divider is
- *      inserted between each named section.
+ *   3. for each entry in `sections`: ONE section block containing the bold
+ *      title on the first line, then one "• item" line per item (flag as an
+ *      italic suffix, link as an inline `<url|open>` mrkdwn link). Items may
+ *      be plain strings or {text, link?, flag?} objects. A divider is
+ *      inserted between each named section. Condensing each section to a
+ *      single block keeps the whole message well under Slack's hard cap of
+ *      50 blocks per message.
  *   4. (optional) recommendations: a bold "Reply-worthy" header, then one
  *      section+actions block pair per recommendation. The section half is
- *      built the same way as a plain item (text + optional link accessory).
- *      The actions half carries three buttons - 🔼 (item_up), 🔽
- *      (item_down), ✅ (item_done) - whose `value` is a JSON string of
- *      `{ items: [...all current recommendations, in order...], actedId }`,
- *      so the whole ordered list travels with every click. No DB, no
- *      server-side state.
+ *      built like a plain item (text + optional link accessory) and carries
+ *      a stable `rec_text_<id>` block_id. The actions half carries three
+ *      buttons - 🔼 (item_up), 🔽 (item_down), ✅ (item_done) - whose
+ *      `value` is a JSON string of `{ items: [...all current
+ *      recommendations, in order...], actedId }`, so the whole ordered list
+ *      travels with every click. No DB, no server-side state. To stay under
+ *      Slack's 2000-char limit on button values, stored items carry only
+ *      {id, text (truncated), done} - links are NOT stored; the
+ *      interactions handler recovers them from the original message's
+ *      `rec_text_<id>` accessory URLs.
  */
+
+// Slack hard limits we render against.
+const SLACK_MAX_BLOCKS = 50;
+const SOFT_MAX_BLOCKS = 45; // our own guard threshold, comfortably below 50
+const MAX_SECTION_TEXT = 2990; // Slack section text cap is 3000 chars
+const MAX_BUTTON_VALUE = 2000; // Slack button `value` cap
+
+/**
+ * Truncates `text` to at most `max` chars, appending "…" when trimmed.
+ *
+ * @param {string} text
+ * @param {number} max
+ * @returns {string}
+ */
+function truncate(text, max) {
+  if (typeof text !== "string") text = String(text == null ? "" : text);
+  if (text.length <= max) return text;
+  return text.slice(0, Math.max(0, max - 1)) + "…";
+}
+
+/**
+ * Normalizes a section item / recommendation to a {text, link?, flag?}
+ * object. Accepts plain strings (a common caller shape) - previously a
+ * string item produced a section block with NO text at all (`item.text` is
+ * undefined on a string), which Slack rejects with invalid_blocks.
+ *
+ * @param {string|{text?: any, link?: string, flag?: string}} item
+ * @returns {{text: string, link?: string, flag?: string}}
+ */
+function normalizeItem(item) {
+  if (typeof item === "string") return { text: item };
+  if (item && typeof item === "object") {
+    const normalized = { ...item, text: item.text == null ? "" : String(item.text) };
+    // Guard against string-prototype leakage (e.g. String.prototype.link).
+    if (typeof normalized.link !== "string") delete normalized.link;
+    if (typeof normalized.flag !== "string") delete normalized.flag;
+    return normalized;
+  }
+  return { text: String(item == null ? "" : item) };
+}
 
 // ---------------------------------------------------------------------------
 // Item-level rendering
@@ -37,9 +82,10 @@
  * @returns {string}
  */
 function itemMrkdwn(item) {
-  let text = item.text;
-  if (item.flag) {
-    text += `  •  _${item.flag}_`;
+  const it = normalizeItem(item);
+  let text = it.text || "-";
+  if (it.flag) {
+    text += `  •  _${it.flag}_`;
   }
   return text;
 }
@@ -53,11 +99,12 @@ function itemMrkdwn(item) {
  * @returns {object} Slack Block Kit `section` block
  */
 function buildItemSectionBlock(item) {
+  item = normalizeItem(item);
   const block = {
     type: "section",
     text: {
       type: "mrkdwn",
-      text: itemMrkdwn(item),
+      text: truncate(itemMrkdwn(item), MAX_SECTION_TEXT),
     },
   };
 
@@ -139,15 +186,41 @@ function buildPriorityRecapBlock(text) {
 // ---------------------------------------------------------------------------
 
 /**
- * @param {{title: string, items: Array<object>}} section
- * @returns {Array<object>} blocks: title block + one block per item
+ * Renders one named section as a SINGLE section block: the bold title on the
+ * first line, then one "• item" line per item (flag as an italic suffix,
+ * link as an inline <url|open> mrkdwn link). Condensing to one block per
+ * section (instead of one block per item) keeps the full message under
+ * Slack's 50-block cap.
+ *
+ * @param {{title: string, items: Array<string|object>}} section
+ * @param {number} [maxItems] - when set and the section has more items,
+ *   only the first `maxItems` are rendered, followed by an
+ *   "…and N more" line
+ * @returns {Array<object>} a single-element array (kept as an array for
+ *   call-site compatibility)
  */
-function buildSectionBlocks(section) {
-  const blocks = [buildTitleBlock(section.title)];
-  (section.items || []).forEach((item) => {
-    blocks.push(buildItemSectionBlock(item));
+function buildSectionBlocks(section, maxItems) {
+  const items = (section.items || []).map(normalizeItem);
+  const shown = maxItems && items.length > maxItems ? items.slice(0, maxItems) : items;
+
+  const lines = [`*${section.title}*`];
+  shown.forEach((item) => {
+    let line = `• ${itemMrkdwn(item)}`;
+    if (item.link) {
+      line += `  <${item.link}|open>`;
+    }
+    lines.push(line);
   });
-  return blocks;
+  if (shown.length < items.length) {
+    lines.push(`_…and ${items.length - shown.length} more_`);
+  }
+
+  return [
+    {
+      type: "section",
+      text: { type: "mrkdwn", text: truncate(lines.join("\n"), MAX_SECTION_TEXT) },
+    },
+  ];
 }
 
 // ---------------------------------------------------------------------------
@@ -171,16 +244,52 @@ const RECS_HEADER_BLOCK_ID = "recs_header";
 const MAX_ITEMS_WITH_REORDER_BUTTONS = 12;
 
 /**
- * Strips a recommendation down to the {id, text, link, done} shape that
- * travels in button `value` payloads (drops any extra fields callers may
- * have set).
- *
- * @param {{id: string, text: string, link?: string, done?: boolean}} rec
+ * Stable per-recommendation block_id prefix for the section half of each
+ * recommendation pair (and for done items). The interactions handler uses
+ * these to recover each recommendation's link (its accessory URL) from the
+ * original message's blocks, since links are deliberately NOT stored in
+ * button values (see buildActionValue).
  */
-function toStoredItem(rec) {
-  const stored = { id: rec.id, text: rec.text, done: !!rec.done };
-  if (rec.link) stored.link = rec.link;
-  return stored;
+const REC_TEXT_BLOCK_ID_PREFIX = "rec_text_";
+
+/**
+ * Strips a recommendation down to the {id, text, done} shape that travels
+ * in button `value` payloads. Links are intentionally NOT included: with
+ * long URLs (e.g. Google Calendar deep links) they blow past Slack's
+ * 2000-char cap on button values, which Slack rejects with invalid_blocks.
+ * The interactions handler recovers links from the original message blocks
+ * instead (via REC_TEXT_BLOCK_ID_PREFIX block_ids).
+ *
+ * @param {{id: string, text: string, done?: boolean}} rec
+ * @param {number} textCap - max stored text length
+ */
+function toStoredItem(rec, textCap) {
+  return { id: rec.id, text: truncate(String(rec.text == null ? "" : rec.text), textCap), done: !!rec.done };
+}
+
+/**
+ * Builds the JSON `value` string carried by every 🔼/🔽/✅ button, keeping
+ * it under Slack's 2000-char button-value limit by progressively shrinking
+ * the per-item stored-text cap until it fits.
+ *
+ * @param {Array<object>} allRecommendations - full ordered list
+ * @param {string} actedId
+ * @returns {string}
+ */
+function buildActionValue(allRecommendations, actedId) {
+  let cap = 150;
+  let value = JSON.stringify({
+    items: allRecommendations.map((rec) => toStoredItem(rec, cap)),
+    actedId,
+  });
+  while (value.length > MAX_BUTTON_VALUE && cap > 10) {
+    cap = Math.floor(cap / 2);
+    value = JSON.stringify({
+      items: allRecommendations.map((rec) => toStoredItem(rec, cap)),
+      actedId,
+    });
+  }
+  return value;
 }
 
 /**
@@ -197,7 +306,8 @@ function buildDoneItemBlock(rec) {
   if (rec.flag) {
     text += `  •  _${rec.flag}_`;
   }
-  rendered.text.text = text;
+  rendered.text.text = truncate(text, MAX_SECTION_TEXT);
+  rendered.block_id = `${REC_TEXT_BLOCK_ID_PREFIX}${rec.id}`;
   return rendered;
 }
 
@@ -212,10 +322,7 @@ function buildDoneItemBlock(rec) {
  * @returns {Array<object>} [section block, actions block]
  */
 function buildRecommendationPairBlocks(allRecommendations, recommendation, rank, compact) {
-  const value = JSON.stringify({
-    items: allRecommendations.map(toStoredItem),
-    actedId: recommendation.id,
-  });
+  const value = buildActionValue(allRecommendations, recommendation.id);
 
   const button = (actionId, emoji) => ({
     type: "button",
@@ -225,7 +332,8 @@ function buildRecommendationPairBlocks(allRecommendations, recommendation, rank,
   });
 
   const sectionBlock = buildItemSectionBlock(recommendation);
-  sectionBlock.text.text = `*${rank}.* ${sectionBlock.text.text}`;
+  sectionBlock.text.text = truncate(`*${rank}.* ${sectionBlock.text.text}`, MAX_SECTION_TEXT);
+  sectionBlock.block_id = `${REC_TEXT_BLOCK_ID_PREFIX}${recommendation.id}`;
 
   const elements = compact
     ? [button("item_done", "✅")]
@@ -295,25 +403,56 @@ function buildRecommendationsBlocks(recommendations) {
  * @returns {Array<object>} full Block Kit `blocks` array
  */
 function buildBriefBlocks({ priority_recap, sections, recommendations } = {}, date) {
-  const blocks = [buildHeaderBlock(date)];
+  const assemble = (sectionList, recs, maxItemsPerSection) => {
+    const blocks = [buildHeaderBlock(date)];
 
-  if (priority_recap) {
-    blocks.push(buildPriorityRecapBlock(priority_recap));
-  }
+    if (priority_recap) {
+      blocks.push(buildPriorityRecapBlock(truncate(String(priority_recap), MAX_SECTION_TEXT - 4)));
+    }
+
+    sectionList.forEach((section, index) => {
+      blocks.push(...buildSectionBlocks(section, maxItemsPerSection));
+      if (index < sectionList.length - 1) {
+        blocks.push({ type: "divider" });
+      }
+    });
+
+    if (recs && recs.length > 0) {
+      if (sectionList.length > 0) {
+        blocks.push({ type: "divider" });
+      }
+      blocks.push(...buildRecommendationsBlocks(recs));
+    }
+
+    return blocks;
+  };
 
   const sectionList = sections || [];
-  sectionList.forEach((section, index) => {
-    blocks.push(...buildSectionBlocks(section));
-    if (index < sectionList.length - 1) {
-      blocks.push({ type: "divider" });
-    }
-  });
+  let recs = recommendations || [];
+  let maxItemsPerSection; // undefined = no per-section item cap
+  let blocks = assemble(sectionList, recs, maxItemsPerSection);
 
-  if (recommendations && recommendations.length > 0) {
-    if (sectionList.length > 0) {
-      blocks.push({ type: "divider" });
-    }
-    blocks.push(...buildRecommendationsBlocks(recommendations));
+  // Hard guard: never send a payload that could exceed Slack's 50-block cap.
+  // Shed lowest-priority content first: extra section items beyond 3 per
+  // section (an "…and N more" line is appended), then recommendations
+  // beyond 8, then (last resort) further recommendations from the tail.
+  if (blocks.length > SOFT_MAX_BLOCKS) {
+    maxItemsPerSection = 3;
+    blocks = assemble(sectionList, recs, maxItemsPerSection);
+  }
+  if (blocks.length > SOFT_MAX_BLOCKS && recs.length > 8) {
+    recs = recs.slice(0, 8);
+    blocks = assemble(sectionList, recs, maxItemsPerSection);
+  }
+  while (blocks.length > SOFT_MAX_BLOCKS && recs.length > 0) {
+    recs = recs.slice(0, recs.length - 1);
+    blocks = assemble(sectionList, recs, maxItemsPerSection);
+  }
+  // Absolute backstop (pathological inputs, e.g. dozens of sections):
+  // dropping trailing blocks keeps the message valid — a trailing section
+  // without its actions block is still legal Block Kit.
+  while (blocks.length > SLACK_MAX_BLOCKS) {
+    blocks.pop();
   }
 
   return blocks;
@@ -388,5 +527,6 @@ module.exports = {
   applyAction,
   RECOMMENDATIONS_TITLE,
   RECS_HEADER_BLOCK_ID,
+  REC_TEXT_BLOCK_ID_PREFIX,
   MAX_ITEMS_WITH_REORDER_BUTTONS,
 };

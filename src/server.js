@@ -7,6 +7,7 @@ const {
   applyAction,
   RECOMMENDATIONS_TITLE,
   RECS_HEADER_BLOCK_ID,
+  REC_TEXT_BLOCK_ID_PREFIX,
 } = require("./blocks");
 const { verifySlackSignature } = require("./verify");
 
@@ -124,6 +125,31 @@ function mergeUpdatedBlocks(originalBlocks, newRecsBlocks) {
   return [...originalBlocks.slice(0, headerIndex), ...newRecsBlocks];
 }
 
+/**
+ * Recovers each recommendation's link from the original message's blocks.
+ * Button `value` payloads deliberately do NOT carry links (long URLs would
+ * blow Slack's 2000-char button-value cap), so on every interaction we read
+ * them back from the `rec_text_<id>` section blocks' accessory URLs.
+ *
+ * @param {Array<object>|undefined} originalBlocks - payload.message.blocks
+ * @returns {Object<string, string>} map of recommendation id -> URL
+ */
+function extractRecLinks(originalBlocks) {
+  const linkById = {};
+  (originalBlocks || []).forEach((block) => {
+    if (
+      block &&
+      typeof block.block_id === "string" &&
+      block.block_id.startsWith(REC_TEXT_BLOCK_ID_PREFIX) &&
+      block.accessory &&
+      typeof block.accessory.url === "string"
+    ) {
+      linkById[block.block_id.slice(REC_TEXT_BLOCK_ID_PREFIX.length)] = block.accessory.url;
+    }
+  });
+  return linkById;
+}
+
 app.post(
   "/slack/interactions",
   express.urlencoded({ extended: false, verify: captureRawBody }),
@@ -178,9 +204,18 @@ app.post(
       return;
     }
 
+    const originalBlocks = payload.message && payload.message.blocks;
+
+    // Re-attach links (not carried in button values) from the original blocks.
+    const linkById = extractRecLinks(originalBlocks);
+    items.forEach((item) => {
+      if (item && !item.link && linkById[item.id]) {
+        item.link = linkById[item.id];
+      }
+    });
+
     const newItems = applyAction(items, actedId, action.action_id);
     const newRecsBlocks = buildRecommendationsBlocks(newItems);
-    const originalBlocks = payload.message && payload.message.blocks;
     const newBlocks = mergeUpdatedBlocks(originalBlocks, newRecsBlocks);
 
     try {
