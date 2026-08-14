@@ -20,14 +20,20 @@
  *      section+actions block pair per recommendation. The section half is
  *      built like a plain item (text + optional link accessory) and carries
  *      a stable `rec_text_<id>` block_id. The actions half carries three
- *      buttons - 🔼 (item_up), 🔽 (item_down), ✅ (item_done) - whose
- *      `value` is a JSON string of `{ items: [...all current
- *      recommendations, in order...], actedId }`, so the whole ordered list
- *      travels with every click. No DB, no server-side state. To stay under
- *      Slack's 2000-char limit on button values, stored items carry only
- *      {id, text (truncated), done} - links are NOT stored; the
- *      interactions handler recovers them from the original message's
- *      `rec_text_<id>` accessory URLs.
+ *      buttons - 🔼 (item_up), 🔽 (item_down), ✅ (item_done) - plus a
+ *      fourth "🤖 Do it" button (item_delegate) when the recommendation is
+ *      marked `delegatable: true`. Button `value` is a JSON string of
+ *      `{ items: [...all current recommendations, in order...], actedId }`,
+ *      so the whole ordered list travels with every click. No DB, no
+ *      server-side state. To stay under Slack's 2000-char limit on button
+ *      values, stored items carry only {id, text (truncated), done}, plus
+ *      `d:1` when delegatable and `delegated:true` once delegated - links
+ *      are NOT stored; the interactions handler recovers them from the
+ *      original message's `rec_text_<id>` accessory URLs.
+ *
+ *      Delegated items (🤖 Do it was clicked) stay in place - not done, not
+ *      sorted last - rendered as "🤖 _queued: text_" with ALL buttons
+ *      removed.
  */
 
 // Slack hard limits we render against.
@@ -238,10 +244,23 @@ const RECOMMENDATIONS_TITLE = "Reply-worthy";
 const RECS_HEADER_BLOCK_ID = "recs_header";
 
 /**
- * Above this many recommendations, per-item buttons are capped to just ✅
- * (🔼/🔽 are skipped) to stay under Slack's block/size limits.
+ * Above this many recommendations, per-item buttons are capped (🔼/🔽 are
+ * skipped) to stay under Slack's block/size limits. Non-delegatable items
+ * keep just ✅; delegatable items keep ✅ AND 🤖 Do it.
  */
 const MAX_ITEMS_WITH_REORDER_BUTTONS = 12;
+
+/**
+ * True when a recommendation may be delegated to the bot ("🤖 Do it").
+ * Accepts both the caller-facing `delegatable: true` shape and the compact
+ * `d: 1` flag that round-trips through button `value` payloads.
+ *
+ * @param {{delegatable?: boolean, d?: number}} rec
+ * @returns {boolean}
+ */
+function isDelegatable(rec) {
+  return !!(rec && (rec.delegatable || rec.d));
+}
 
 /**
  * Stable per-recommendation block_id prefix for the section half of each
@@ -254,17 +273,22 @@ const REC_TEXT_BLOCK_ID_PREFIX = "rec_text_";
 
 /**
  * Strips a recommendation down to the {id, text, done} shape that travels
- * in button `value` payloads. Links are intentionally NOT included: with
- * long URLs (e.g. Google Calendar deep links) they blow past Slack's
- * 2000-char cap on button values, which Slack rejects with invalid_blocks.
- * The interactions handler recovers links from the original message blocks
- * instead (via REC_TEXT_BLOCK_ID_PREFIX block_ids).
+ * in button `value` payloads, plus a compact `d: 1` flag when the item is
+ * delegatable (omitted otherwise, to save value bytes) and `delegated: true`
+ * once it has been queued via 🤖 Do it. Links are intentionally NOT
+ * included: with long URLs (e.g. Google Calendar deep links) they blow past
+ * Slack's 2000-char cap on button values, which Slack rejects with
+ * invalid_blocks. The interactions handler recovers links from the original
+ * message blocks instead (via REC_TEXT_BLOCK_ID_PREFIX block_ids).
  *
- * @param {{id: string, text: string, done?: boolean}} rec
+ * @param {{id: string, text: string, done?: boolean, delegatable?: boolean, delegated?: boolean}} rec
  * @param {number} textCap - max stored text length
  */
 function toStoredItem(rec, textCap) {
-  return { id: rec.id, text: truncate(String(rec.text == null ? "" : rec.text), textCap), done: !!rec.done };
+  const stored = { id: rec.id, text: truncate(String(rec.text == null ? "" : rec.text), textCap), done: !!rec.done };
+  if (isDelegatable(rec)) stored.d = 1;
+  if (rec.delegated) stored.delegated = true;
+  return stored;
 }
 
 /**
@@ -312,22 +336,45 @@ function buildDoneItemBlock(rec) {
 }
 
 /**
- * Builds the section+actions block pair for one NOT-done recommendation.
+ * Builds the section block for a DELEGATED recommendation (🤖 Do it was
+ * clicked): "🤖 _queued: text_", and NO actions block (🔼/🔽/✅/🤖 are all
+ * removed). The item stays where it was in the list - it is neither done
+ * nor sorted last. A link accessory, if present, is kept - it's client-side
+ * only, and it lets the interactions handler keep recovering the link.
+ *
+ * @param {{id: string, text: string, link?: string, flag?: string}} rec
+ * @returns {object} Slack Block Kit `section` block
+ */
+function buildDelegatedItemBlock(rec) {
+  const rendered = buildItemSectionBlock(rec);
+  let text = `🤖 _queued: ${rec.text}_`;
+  if (rec.flag) {
+    text += `  •  _${rec.flag}_`;
+  }
+  rendered.text.text = truncate(text, MAX_SECTION_TEXT);
+  rendered.block_id = `${REC_TEXT_BLOCK_ID_PREFIX}${rec.id}`;
+  return rendered;
+}
+
+/**
+ * Builds the section+actions block pair for one NOT-done, NOT-delegated
+ * recommendation.
  *
  * @param {Array<object>} allRecommendations - full ordered list (for the button value)
  * @param {object} recommendation - the one this pair renders
  * @param {number} rank - 1-based rank among NOT-done items only
- * @param {boolean} compact - when true, only the ✅ button is emitted
- *   (list is large; skip 🔼/🔽 to stay under Slack block limits)
+ * @param {boolean} compact - when true, 🔼/🔽 are skipped (list is large;
+ *   stay under Slack block limits): non-delegatable items keep just ✅,
+ *   delegatable items keep ✅ and 🤖 Do it
  * @returns {Array<object>} [section block, actions block]
  */
 function buildRecommendationPairBlocks(allRecommendations, recommendation, rank, compact) {
   const value = buildActionValue(allRecommendations, recommendation.id);
 
-  const button = (actionId, emoji) => ({
+  const button = (actionId, label) => ({
     type: "button",
     action_id: actionId,
-    text: { type: "plain_text", text: emoji, emoji: true },
+    text: { type: "plain_text", text: label, emoji: true },
     value,
   });
 
@@ -338,6 +385,9 @@ function buildRecommendationPairBlocks(allRecommendations, recommendation, rank,
   const elements = compact
     ? [button("item_done", "✅")]
     : [button("item_up", "🔼"), button("item_down", "🔽"), button("item_done", "✅")];
+  if (isDelegatable(recommendation)) {
+    elements.push(button("item_delegate", "🤖 Do it"));
+  }
 
   return [
     sectionBlock,
@@ -381,6 +431,8 @@ function buildRecommendationsBlocks(recommendations) {
   items.forEach((rec) => {
     if (rec.done) {
       blocks.push(buildDoneItemBlock(rec));
+    } else if (rec.delegated) {
+      blocks.push(buildDelegatedItemBlock(rec));
     } else {
       rank += 1;
       blocks.push(...buildRecommendationPairBlocks(items, rec, rank, compact));
@@ -479,15 +531,20 @@ function sortDoneLast(items) {
  *
  * - item_done: marks the item done (it is NOT removed; it renders with
  *   strikethrough and no buttons, and sorts to the bottom).
- * - item_up / item_down: swaps the item with its previous/next NOT-done
- *   neighbor. No-ops at the boundaries, and no-ops for done items.
+ * - item_delegate: marks the item delegated (it is NOT removed, NOT done,
+ *   and NOT sorted last - it stays in place, rendered as "🤖 _queued: …_"
+ *   with all buttons removed).
+ * - item_up / item_down: swaps the item with its previous/next NOT-done,
+ *   NOT-delegated neighbor. No-ops at the boundaries, and no-ops for
+ *   done/delegated items (they have no buttons anyway).
  *
  * The returned array is always re-partitioned so done items sit at the
- * bottom, preserving relative order within each group.
+ * bottom, preserving relative order within each group (delegated items are
+ * NOT done, so they keep their position among the not-done items).
  *
- * @param {Array<{id: string, done?: boolean}>} items
+ * @param {Array<{id: string, done?: boolean, delegated?: boolean}>} items
  * @param {string} actedId
- * @param {"item_up"|"item_down"|"item_done"} actionId
+ * @param {"item_up"|"item_down"|"item_done"|"item_delegate"} actionId
  * @returns {Array<object>} the new items array
  */
 function applyAction(items, actedId, actionId) {
@@ -501,11 +558,20 @@ function applyAction(items, actedId, actionId) {
 
   if (actionId === "item_done") {
     next[index].done = true;
-  } else if ((actionId === "item_up" || actionId === "item_down") && !next[index].done) {
+  } else if (actionId === "item_delegate") {
+    if (!next[index].done) {
+      next[index].delegated = true;
+    }
+  } else if (
+    (actionId === "item_up" || actionId === "item_down") &&
+    !next[index].done &&
+    !next[index].delegated
+  ) {
     const dir = actionId === "item_up" ? -1 : 1;
-    // Find the nearest NOT-done neighbor in the given direction.
+    // Find the nearest NOT-done, NOT-delegated neighbor in the given
+    // direction (delegated items stay in place).
     let j = index + dir;
-    while (j >= 0 && j < next.length && next[j].done) {
+    while (j >= 0 && j < next.length && (next[j].done || next[j].delegated)) {
       j += dir;
     }
     if (j >= 0 && j < next.length) {

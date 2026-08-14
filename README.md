@@ -37,6 +37,14 @@ Action semantics:
 - ✅ (`item_done`): marks the item done — it is **not removed**. It stays in
   the list rendered as "✅ ~struck-through text~" with no action buttons, and
   done items sort to the bottom of the recommendations list on rebuild.
+- 🤖 Do it (`item_delegate`): only present on recommendations sent with
+  `delegatable: true` (default `false`). Clicking it pushes the item onto the
+  in-memory **delegation queue** (see `/delegations/pending` below; the
+  item's link is recovered from the message's accessory URLs) and re-renders
+  the item's line as "🤖 _queued: text_" with **all** buttons (🔼/🔽/✅/🤖)
+  removed. The delegated item **stays in place** — it is not marked done and
+  is not sorted to the bottom. In button `value` payloads, delegatable items
+  carry a compact `d: 1` flag and delegated ones carry `delegated: true`.
 
 To avoid losing the sections above the recommendations on update (the button
 `value` only carries recommendations), the recommendations header block has a
@@ -48,10 +56,11 @@ rebuilt recommendations blocks.
 
 **Block-limit guard:** each not-done recommendation costs 2 blocks (section +
 actions). When a payload carries more than 12 recommendations, the per-item
-buttons are capped to just ✅ (🔼/🔽 are skipped) to stay under Slack's
-message block/size limits — a large digest previously tripped
-`invalid_blocks`. The rebuild path uses the same builder as `/render-brief`,
-so block counts stay consistent between the initial post and updates.
+buttons are capped (🔼/🔽 are skipped) to stay under Slack's message
+block/size limits — a large digest previously tripped `invalid_blocks`.
+Non-delegatable items keep just ✅; delegatable items keep ✅ **and** 🤖 Do
+it. The rebuild path uses the same builder as `/render-brief`, so block
+counts stay consistent between the initial post and updates.
 
 Items/recommendations with a `link` get a "Open" URL button **accessory**
 (not an actions-block button) — Slack opens these directly client-side, so
@@ -93,12 +102,14 @@ The main entrypoint (e.g. called by a scheduled routine every morning).
     ],
     "recommendations": [
       { "id": "1", "text": "Approve the Q3 roadmap doc", "link": "https://docs.example.com/q3" },
-      { "id": "2", "text": "Congratulate the team on the launch" }
+      { "id": "2", "text": "Congratulate the team on the launch", "delegatable": true }
     ]
   }
   ```
   `thread_ts` is optional (omit to post as a new top-level message).
   `priority_recap`, `sections`, and `recommendations` are all optional.
+  A recommendation with `delegatable: true` gets an extra "🤖 Do it" button
+  (see the action semantics above); the default is `false`.
 - Calls Slack's `chat.postMessage` and returns:
   ```json
   { "ok": true, "ts": "1700000000.000100" }
@@ -119,6 +130,53 @@ than 5 minutes old are rejected as replays, `401`). On a valid request it
 acks with an empty `200` immediately, then asynchronously POSTs the rebuilt
 message (`{ replace_original: true, blocks, text }`) to the payload's
 `response_url`. Not meant to be called directly by anything other than Slack.
+
+### `GET /delegations/pending`
+
+Returns the delegation-queue entries (one per "🤖 Do it" click) that are
+still awaiting an ack:
+
+```json
+{
+  "items": [
+    {
+      "id": "6f1e2a9c-....",
+      "itemId": "2",
+      "text": "Congratulate the team on the launch",
+      "link": "https://docs.example.com/q3",
+      "clickedAt": "2026-08-14T12:34:56.789Z",
+      "status": "pending"
+    }
+  ]
+}
+```
+
+- Auth: header `X-Internal-Secret` must match `INTERNAL_API_SECRET` (same
+  scheme as `/render-brief`). Missing or wrong → `401`.
+- `id` is a server-generated UUID for the queue entry; `itemId` is the
+  recommendation's own id; `link` is recovered from the original message's
+  accessory URLs at click time (`null` when the item had no link).
+
+### `POST /delegations/ack`
+
+Marks queue entries as handled.
+
+- Auth: header `X-Internal-Secret`, as above. Missing or wrong → `401`.
+- Body:
+  ```json
+  { "ids": ["6f1e2a9c-...."], "status": "done", "note": "optional note" }
+  ```
+  `status` must be `"done"` or `"failed"`; anything else (or a non-array
+  `ids`) → `400`.
+- Responds `{ "ok": true, "updated": N }` where `N` is the number of matching
+  entries updated. Acked entries stay in memory but leave the
+  `/delegations/pending` list.
+
+> **Restart caveat:** the delegation queue is **in-memory only** (v1). A
+> dyno/instance restart or redeploy **drops any queued 🤖 clicks** that have
+> not been drained yet — the Slack message will still show those items as
+> "🤖 _queued: …_", but they will no longer appear in
+> `/delegations/pending`. Accepted v1 behavior; drain the queue promptly.
 
 ## Required environment variables
 

@@ -1,5 +1,6 @@
 "use strict";
 
+const crypto = require("crypto");
 const express = require("express");
 const {
   buildBriefBlocks,
@@ -19,6 +20,31 @@ const SLACK_SIGNING_SECRET = process.env.SLACK_SIGNING_SECRET;
 const INTERNAL_API_SECRET = process.env.INTERNAL_API_SECRET;
 
 // ---------------------------------------------------------------------------
+// In-memory delegation queue. Every "🤖 Do it" click pushes an entry here;
+// an external worker drains it via GET /delegations/pending and marks
+// entries via POST /delegations/ack. Entries live ONLY in this process's
+// memory - a dyno/instance restart drops any queued clicks (accepted v1
+// behavior; see README).
+//
+// Entry shape: { id, itemId, text, link, clickedAt, status } where status is
+// "pending" | "done" | "failed" (acks may also attach `note`/`ackedAt`).
+// ---------------------------------------------------------------------------
+const delegations = [];
+
+/**
+ * Shared-secret guard used by /render-brief and the /delegations endpoints:
+ * the X-Internal-Secret header must match INTERNAL_API_SECRET (401
+ * otherwise, including when the env var is unset).
+ */
+function requireInternalSecret(req, res, next) {
+  const providedSecret = req.get("X-Internal-Secret");
+  if (!INTERNAL_API_SECRET || providedSecret !== INTERNAL_API_SECRET) {
+    return res.status(401).json({ ok: false, error: "unauthorized" });
+  }
+  next();
+}
+
+// ---------------------------------------------------------------------------
 // GET /healthz - trivial health check. Also used as a keep-warm ping target
 // (see README) so /slack/interactions stays responsive on free-tier hosting.
 // ---------------------------------------------------------------------------
@@ -35,12 +61,7 @@ app.get("/healthz", (req, res) => {
 // scoped to this route so it never interferes with /slack/interactions'
 // form-encoded parsing below.
 // ---------------------------------------------------------------------------
-app.post("/render-brief", express.json(), async (req, res) => {
-  const providedSecret = req.get("X-Internal-Secret");
-  if (!INTERNAL_API_SECRET || providedSecret !== INTERNAL_API_SECRET) {
-    return res.status(401).json({ ok: false, error: "unauthorized" });
-  }
-
+app.post("/render-brief", requireInternalSecret, express.json(), async (req, res) => {
   const { channel, thread_ts, priority_recap, sections, recommendations } = req.body || {};
 
   if (!channel) {
@@ -198,12 +219,6 @@ app.post(
     // deadline regardless of how long that follow-up POST takes.
     res.status(200).end();
 
-    const responseUrl = payload.response_url;
-    if (!responseUrl) {
-      console.error("block_actions payload had no response_url; cannot update message");
-      return;
-    }
-
     const originalBlocks = payload.message && payload.message.blocks;
 
     // Re-attach links (not carried in button values) from the original blocks.
@@ -213,6 +228,27 @@ app.post(
         item.link = linkById[item.id];
       }
     });
+
+    // "🤖 Do it": push the clicked item onto the in-memory delegation queue
+    // (link recovered from the message's accessory URLs above), regardless
+    // of whether the message update below succeeds.
+    if (action.action_id === "item_delegate") {
+      const acted = items.find((item) => item && item.id === actedId);
+      delegations.push({
+        id: crypto.randomUUID(),
+        itemId: actedId,
+        text: acted && acted.text ? acted.text : "",
+        link: (acted && acted.link) || null,
+        clickedAt: new Date().toISOString(),
+        status: "pending",
+      });
+    }
+
+    const responseUrl = payload.response_url;
+    if (!responseUrl) {
+      console.error("block_actions payload had no response_url; cannot update message");
+      return;
+    }
 
     const newItems = applyAction(items, actedId, action.action_id);
     const newRecsBlocks = buildRecommendationsBlocks(newItems);
@@ -240,6 +276,52 @@ app.post(
     }
   }
 );
+
+// ---------------------------------------------------------------------------
+// GET /delegations/pending
+//
+// Returns every delegation-queue entry still awaiting an ack:
+// { items: [{ id, itemId, text, link, clickedAt, status: "pending" }] }.
+// Protected by the same X-Internal-Secret header as /render-brief.
+// ---------------------------------------------------------------------------
+app.get("/delegations/pending", requireInternalSecret, (req, res) => {
+  res.json({ items: delegations.filter((entry) => entry.status === "pending") });
+});
+
+// ---------------------------------------------------------------------------
+// POST /delegations/ack
+//
+// Body: { ids: [...], status: "done"|"failed", note?: string }. Marks the
+// matching queue entries with the given status (entries stay in memory -
+// they simply leave the pending list). Responds { ok: true, updated: N }.
+// Protected by the same X-Internal-Secret header as /render-brief.
+// ---------------------------------------------------------------------------
+app.post("/delegations/ack", requireInternalSecret, express.json(), (req, res) => {
+  const { ids, status, note } = req.body || {};
+
+  if (!Array.isArray(ids) || (status !== "done" && status !== "failed")) {
+    return res.status(400).json({
+      ok: false,
+      error: "bad_request",
+      message: 'Expected { ids: [...], status: "done"|"failed", note?: string }',
+    });
+  }
+
+  const idSet = new Set(ids);
+  let updated = 0;
+  delegations.forEach((entry) => {
+    if (idSet.has(entry.id)) {
+      entry.status = status;
+      entry.ackedAt = new Date().toISOString();
+      if (typeof note === "string" && note) {
+        entry.note = note;
+      }
+      updated += 1;
+    }
+  });
+
+  res.json({ ok: true, updated });
+});
 
 app.listen(PORT, () => {
   console.log(`Chief of Staff bot listening on port ${PORT}`);
