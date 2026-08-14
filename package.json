@@ -1,0 +1,16 @@
+{
+  "name": "gustavo-chief-of-staff-bot",
+  "version": "1.0.0",
+  "description": "Slack app backend for Chief of Staff - renders a Morning Brief with Block Kit and handles interactive up/down/done actions statelessly.",
+  "main": "src/server.js",
+  "scripts": {
+    "start": "node src/server.js"
+  },
+  "license": "MIT",
+  "dependencies": {
+    "express": "^4.19.2"
+  },
+  "engines": {
+    "node": ">=18"
+  }
+}
