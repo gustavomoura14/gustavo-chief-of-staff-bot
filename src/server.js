@@ -1,7 +1,13 @@
 "use strict";
 
 const express = require("express");
-const { buildBriefBlocks, buildRecommendationsBlocks, applyAction } = require("./blocks");
+const {
+  buildBriefBlocks,
+  buildRecommendationsBlocks,
+  applyAction,
+  RECOMMENDATIONS_TITLE,
+  RECS_HEADER_BLOCK_ID,
+} = require("./blocks");
 const { verifySlackSignature } = require("./verify");
 
 const app = express();
@@ -87,10 +93,41 @@ const captureRawBody = (req, res, buf) => {
   req.rawBody = buf;
 };
 
+/**
+ * Merges the rebuilt recommendations blocks into the original message's
+ * blocks: everything ABOVE the recommendations header (found by its stable
+ * `recs_header` block_id) is preserved, and everything from the header down
+ * is replaced with the rebuilt list. Falls back to matching the header by
+ * its "*Reply-worthy*" text (for messages posted before block_ids existed),
+ * and finally to just the rebuilt recommendations blocks when the original
+ * blocks are unavailable.
+ *
+ * @param {Array<object>|undefined} originalBlocks - payload.message.blocks
+ * @param {Array<object>} newRecsBlocks
+ * @returns {Array<object>}
+ */
+function mergeUpdatedBlocks(originalBlocks, newRecsBlocks) {
+  if (!Array.isArray(originalBlocks) || originalBlocks.length === 0) {
+    return newRecsBlocks;
+  }
+
+  let headerIndex = originalBlocks.findIndex((b) => b && b.block_id === RECS_HEADER_BLOCK_ID);
+  if (headerIndex === -1) {
+    headerIndex = originalBlocks.findIndex(
+      (b) => b && b.type === "section" && b.text && b.text.text === `*${RECOMMENDATIONS_TITLE}*`
+    );
+  }
+  if (headerIndex === -1) {
+    return newRecsBlocks;
+  }
+
+  return [...originalBlocks.slice(0, headerIndex), ...newRecsBlocks];
+}
+
 app.post(
   "/slack/interactions",
   express.urlencoded({ extended: false, verify: captureRawBody }),
-  (req, res) => {
+  async (req, res) => {
     const timestamp = req.get("X-Slack-Request-Timestamp");
     const signature = req.get("X-Slack-Signature");
 
@@ -129,17 +166,43 @@ app.post(
       return res.status(400).json({ ok: false, error: "bad_action_value" });
     }
 
-    const newItems = applyAction(items, actedId, action.action_id);
-    const newBlocks = buildRecommendationsBlocks(newItems);
+    // Ack immediately with an empty 200. Slack IGNORES the ack body for
+    // block_actions message updates - the update must instead be POSTed to
+    // the payload's response_url. Acking first keeps us inside Slack's 3s
+    // deadline regardless of how long that follow-up POST takes.
+    res.status(200).end();
 
-    // Responding here, within this same HTTP response, is how Slack lets us
-    // update ("replace") the original message - no outbound Slack API call
-    // needed.
-    return res.status(200).json({
-      replace_original: true,
-      text: "Chief of Staff briefing",
-      blocks: newBlocks,
-    });
+    const responseUrl = payload.response_url;
+    if (!responseUrl) {
+      console.error("block_actions payload had no response_url; cannot update message");
+      return;
+    }
+
+    const newItems = applyAction(items, actedId, action.action_id);
+    const newRecsBlocks = buildRecommendationsBlocks(newItems);
+    const originalBlocks = payload.message && payload.message.blocks;
+    const newBlocks = mergeUpdatedBlocks(originalBlocks, newRecsBlocks);
+
+    try {
+      const updateResponse = await fetch(responseUrl, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({
+          replace_original: true,
+          text: "Chief of Staff briefing",
+          blocks: newBlocks,
+        }),
+      });
+      if (!updateResponse.ok) {
+        console.error(
+          `response_url update failed: HTTP ${updateResponse.status} ${await updateResponse
+            .text()
+            .catch(() => "")}`
+        );
+      }
+    } catch (err) {
+      console.error("Error POSTing message update to response_url:", err);
+    }
   }
 );
 

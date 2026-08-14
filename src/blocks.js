@@ -2,7 +2,9 @@
 
 /**
  * Block Kit builders for the Chief of Staff "Morning Brief" message, plus
- * the stateless up/down/done logic used to re-rank/remove recommendations.
+ * the stateless up/down/done logic used to re-rank recommendations and mark
+ * them done (done items stay in the list, rendered struck-through with no
+ * buttons, sorted to the bottom).
  *
  * Message shape (top to bottom):
  *   1. header block - date-stamped title, e.g. "☀️ Morning Brief — Friday, August 14"
@@ -155,25 +157,61 @@ function buildSectionBlocks(section) {
 const RECOMMENDATIONS_TITLE = "Reply-worthy";
 
 /**
- * Strips a recommendation down to the {id, text, link} shape that travels in
- * button `value` payloads (drops any extra fields callers may have set).
+ * Stable block_id for the recommendations header. The interactions handler
+ * uses this to find where the recommendations sub-list starts inside the
+ * original message's blocks, so it can replace everything from here down
+ * while preserving the sections above.
+ */
+const RECS_HEADER_BLOCK_ID = "recs_header";
+
+/**
+ * Above this many recommendations, per-item buttons are capped to just ✅
+ * (🔼/🔽 are skipped) to stay under Slack's block/size limits.
+ */
+const MAX_ITEMS_WITH_REORDER_BUTTONS = 12;
+
+/**
+ * Strips a recommendation down to the {id, text, link, done} shape that
+ * travels in button `value` payloads (drops any extra fields callers may
+ * have set).
  *
- * @param {{id: string, text: string, link?: string}} rec
+ * @param {{id: string, text: string, link?: string, done?: boolean}} rec
  */
 function toStoredItem(rec) {
-  const stored = { id: rec.id, text: rec.text };
+  const stored = { id: rec.id, text: rec.text, done: !!rec.done };
   if (rec.link) stored.link = rec.link;
   return stored;
 }
 
 /**
- * Builds the section+actions block pair for one recommendation.
+ * Builds the section block for a DONE recommendation: "✅ " prefix,
+ * strikethrough text, and NO actions block (done items get no buttons).
+ * A link accessory, if present, is kept - it's client-side only.
+ *
+ * @param {{text: string, link?: string, flag?: string}} rec
+ * @returns {object} Slack Block Kit `section` block
+ */
+function buildDoneItemBlock(rec) {
+  const rendered = buildItemSectionBlock(rec);
+  let text = `✅ ~${rec.text}~`;
+  if (rec.flag) {
+    text += `  •  _${rec.flag}_`;
+  }
+  rendered.text.text = text;
+  return rendered;
+}
+
+/**
+ * Builds the section+actions block pair for one NOT-done recommendation.
  *
  * @param {Array<object>} allRecommendations - full ordered list (for the button value)
  * @param {object} recommendation - the one this pair renders
+ * @param {number} rank - 1-based rank among NOT-done items only
+ * @param {boolean} compact - when true, only the ✅ button is emitted
+ *   (list is large; skip 🔼/🔽 to stay under Slack block limits)
  * @returns {Array<object>} [section block, actions block]
  */
-function buildRecommendationPairBlocks(allRecommendations, recommendation) {
+function buildRecommendationPairBlocks(allRecommendations, recommendation, rank, compact) {
   const value = JSON.stringify({
     items: allRecommendations.map(toStoredItem),
     actedId: recommendation.id,
@@ -186,31 +224,40 @@ function buildRecommendationPairBlocks(allRecommendations, recommendation) {
     value,
   });
 
+  const sectionBlock = buildItemSectionBlock(recommendation);
+  sectionBlock.text.text = `*${rank}.* ${sectionBlock.text.text}`;
+
+  const elements = compact
+    ? [button("item_done", "✅")]
+    : [button("item_up", "🔼"), button("item_down", "🔽"), button("item_done", "✅")];
+
   return [
-    buildItemSectionBlock(recommendation),
+    sectionBlock,
     {
       type: "actions",
       block_id: `rec_actions_${recommendation.id}`,
-      elements: [
-        button("item_up", "🔼"),
-        button("item_down", "🔽"),
-        button("item_done", "✅"),
-      ],
+      elements,
     },
   ];
 }
 
 /**
- * Builds the full recommendations sub-list: bold header + one section+actions
- * pair per recommendation, in order. Used both by the initial /render-brief
- * message and to rebuild just this sub-list after a button click.
+ * Builds the full recommendations sub-list: bold header (with the stable
+ * `recs_header` block_id) + blocks per recommendation, in order. NOT-done
+ * items get a rank number (counting non-done items only) and a
+ * section+actions pair; done items render as a single section block with
+ * "✅ " + strikethrough text and no buttons. Used both by the initial
+ * /render-brief message and to rebuild just this sub-list after a button
+ * click, so sizes stay consistent between the two paths.
  *
- * @param {Array<{id: string, text: string, link?: string}>} recommendations
+ * @param {Array<{id: string, text: string, link?: string, done?: boolean}>} recommendations
  * @returns {Array<object>}
  */
 function buildRecommendationsBlocks(recommendations) {
   const items = recommendations || [];
-  const blocks = [buildTitleBlock(RECOMMENDATIONS_TITLE)];
+  const titleBlock = buildTitleBlock(RECOMMENDATIONS_TITLE);
+  titleBlock.block_id = RECS_HEADER_BLOCK_ID;
+  const blocks = [titleBlock];
 
   if (items.length === 0) {
     blocks.push({
@@ -220,8 +267,16 @@ function buildRecommendationsBlocks(recommendations) {
     return blocks;
   }
 
+  const compact = items.length > MAX_ITEMS_WITH_REORDER_BUTTONS;
+
+  let rank = 0;
   items.forEach((rec) => {
-    blocks.push(...buildRecommendationPairBlocks(items, rec));
+    if (rec.done) {
+      blocks.push(buildDoneItemBlock(rec));
+    } else {
+      rank += 1;
+      blocks.push(...buildRecommendationPairBlocks(items, rec, rank, compact));
+    }
   });
 
   return blocks;
@@ -269,37 +324,57 @@ function buildBriefBlocks({ priority_recap, sections, recommendations } = {}, da
 // ---------------------------------------------------------------------------
 
 /**
- * Applies a button action to the recommendations array, returning a NEW
- * array (does not mutate the input). No-ops moving the top item up or the
- * bottom item down.
+ * Stable partition: NOT-done items first (in their current relative order),
+ * done items after (in their current relative order).
  *
- * @param {Array<{id: string}>} items
+ * @param {Array<{done?: boolean}>} items
+ * @returns {Array<object>}
+ */
+function sortDoneLast(items) {
+  return [...items.filter((i) => !i.done), ...items.filter((i) => i.done)];
+}
+
+/**
+ * Applies a button action to the recommendations array, returning a NEW
+ * array (does not mutate the input).
+ *
+ * - item_done: marks the item done (it is NOT removed; it renders with
+ *   strikethrough and no buttons, and sorts to the bottom).
+ * - item_up / item_down: swaps the item with its previous/next NOT-done
+ *   neighbor. No-ops at the boundaries, and no-ops for done items.
+ *
+ * The returned array is always re-partitioned so done items sit at the
+ * bottom, preserving relative order within each group.
+ *
+ * @param {Array<{id: string, done?: boolean}>} items
  * @param {string} actedId
  * @param {"item_up"|"item_down"|"item_done"} actionId
  * @returns {Array<object>} the new items array
  */
 function applyAction(items, actedId, actionId) {
-  const next = items.map((item) => ({ ...item }));
+  const next = items.map((item) => ({ ...item, done: !!item.done }));
   const index = next.findIndex((item) => item.id === actedId);
 
   if (index === -1) {
     // Acted item no longer present (shouldn't normally happen) - no-op.
-    return next;
+    return sortDoneLast(next);
   }
 
-  if (actionId === "item_up") {
-    if (index > 0) {
-      [next[index - 1], next[index]] = [next[index], next[index - 1]];
+  if (actionId === "item_done") {
+    next[index].done = true;
+  } else if ((actionId === "item_up" || actionId === "item_down") && !next[index].done) {
+    const dir = actionId === "item_up" ? -1 : 1;
+    // Find the nearest NOT-done neighbor in the given direction.
+    let j = index + dir;
+    while (j >= 0 && j < next.length && next[j].done) {
+      j += dir;
     }
-  } else if (actionId === "item_down") {
-    if (index < next.length - 1) {
-      [next[index], next[index + 1]] = [next[index + 1], next[index]];
+    if (j >= 0 && j < next.length) {
+      [next[index], next[j]] = [next[j], next[index]];
     }
-  } else if (actionId === "item_done") {
-    next.splice(index, 1);
   }
 
-  return next;
+  return sortDoneLast(next);
 }
 
 module.exports = {
@@ -312,4 +387,6 @@ module.exports = {
   buildBriefBlocks,
   applyAction,
   RECOMMENDATIONS_TITLE,
+  RECS_HEADER_BLOCK_ID,
+  MAX_ITEMS_WITH_REORDER_BUTTONS,
 };

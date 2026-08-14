@@ -16,14 +16,42 @@ and a list of `{text, link?, flag?}` items), and an array of `recommendations`
 (`{id, text, link?}`), then calls Slack's `chat.postMessage`.
 
 Each recommendation's 🔼/🔽/✅ buttons carry a `value` that is a JSON string:
-`{"items": [...all current recommendations in order...], "actedId": "<this item's id>"}`.
-When a button is clicked, Slack POSTs that payload to `/slack/interactions`.
-The server verifies the request signature, decodes `items`/`actedId` from the
-clicked button's `value`, applies the action (move up / move down / mark
-done), rebuilds just the recommendations blocks from the new array, and
-responds immediately with `{ replace_original: true, blocks, text }` — which
-is how Slack updates the original message directly from the interactivity
-response, with no outbound Slack API call required.
+`{"items": [{"id","text","link?","done"}...all current recommendations in
+order...], "actedId": "<this item's id>"}`. When a button is clicked, Slack
+POSTs that payload to `/slack/interactions`. The server verifies the request
+signature, **acks immediately with an empty HTTP 200** (Slack ignores the ack
+body for `block_actions` message updates, so responding with
+`replace_original` in the ack does nothing), then decodes `items`/`actedId`
+from the clicked button's `value`, applies the action, rebuilds the
+recommendations blocks, and **POSTs the update to the payload's
+`response_url`** with `{ replace_original: true, blocks, text }`
+(`Content-Type: application/json`). That follow-up POST is what actually
+replaces the original message.
+
+Action semantics:
+
+- 🔼 / 🔽 (`item_up` / `item_down`): swap the item with its previous/next
+  **not-done** neighbor. No-ops at the top/bottom boundaries. Not-done items
+  are numbered (`1.`, `2.`, ...) counting non-done items only, and renumber
+  on every rebuild.
+- ✅ (`item_done`): marks the item done — it is **not removed**. It stays in
+  the list rendered as "✅ ~struck-through text~" with no action buttons, and
+  done items sort to the bottom of the recommendations list on rebuild.
+
+To avoid losing the sections above the recommendations on update (the button
+`value` only carries recommendations), the recommendations header block has a
+stable `block_id` (`recs_header`). The handler takes the original message's
+blocks from `payload.message.blocks`, keeps everything above that header, and
+replaces everything from the header down with the rebuilt recommendations
+blocks. If `payload.message.blocks` is missing, it falls back to just the
+rebuilt recommendations blocks.
+
+**Block-limit guard:** each not-done recommendation costs 2 blocks (section +
+actions). When a payload carries more than 12 recommendations, the per-item
+buttons are capped to just ✅ (🔼/🔽 are skipped) to stay under Slack's
+message block/size limits — a large digest previously tripped
+`invalid_blocks`. The rebuild path uses the same builder as `/render-brief`,
+so block counts stay consistent between the initial post and updates.
 
 Items/recommendations with a `link` get a "Open" URL button **accessory**
 (not an actions-block button) — Slack opens these directly client-side, so
@@ -87,8 +115,10 @@ Slack's interactivity endpoint (block_actions). Configure this as your Slack
 app's **Interactivity Request URL**. Verifies the request using
 `SLACK_SIGNING_SECRET` (HMAC-SHA256 over `v0:{timestamp}:{raw_body}`,
 compared to the `X-Slack-Signature` header; requests with a timestamp more
-than 5 minutes old are rejected as replays, `401`). Not meant to be called
-directly by anything other than Slack.
+than 5 minutes old are rejected as replays, `401`). On a valid request it
+acks with an empty `200` immediately, then asynchronously POSTs the rebuilt
+message (`{ replace_original: true, blocks, text }`) to the payload's
+`response_url`. Not meant to be called directly by anything other than Slack.
 
 ## Required environment variables
 
