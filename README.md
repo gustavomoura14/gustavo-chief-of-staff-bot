@@ -142,9 +142,56 @@ close-out.
   | `new_today` | number | Items new today. |
   | `on_call` | boolean | Renders `🔴 yes` / `—`. |
   | `notes` | string[] | Short lines, one context row each. |
+  | `burndown` | object | Optional inbox burn-down bar — see below. |
+  | `tasks` | object[] | Optional triage-board tasks — see below. |
 
   **All numeric fields are optional** — only fields actually present are
   rendered (no empty rows).
+
+#### `burndown` (optional)
+
+```json
+{ "baseline": 10, "current": 6, "slack_unreads": 2, "email_unreads": 4 }
+```
+
+Rendered **above the triage section**: a 10-segment `█`/`░` bar of the
+cleared fraction `(baseline - current) / baseline` (clamped to 0–1), an
+"X of Y cleared" label, and a breakdown context line
+`💬 N Slack | 📧 N Email`. Special cases:
+
+- `current === 0 && baseline > 0` → a celebratory **"🎉 Inbox Zero!"**
+  header replaces the bar.
+- `baseline` absent, non-numeric, or `0` → the whole section is skipped.
+
+#### `tasks` (optional)
+
+```json
+[
+  { "id": "t1", "text": "Reply to vendor thread", "source": "slack",
+    "link": "https://…", "status": "todo" }
+]
+```
+
+| Field | Type | Meaning |
+| --- | --- | --- |
+| `id` | string, required | Stable task id (echoed back on completion). |
+| `text` | string, required | Task text. |
+| `source` | `"slack"` \| `"email"` \| `"manual"` | Rendered as 💬 / 📧 / 📝 (default 📝). |
+| `link` | string | Rendered as an inline `open` link. |
+| `status` | `"todo"` \| `"doing"` | `"doing"` adds a 🔄 marker. |
+
+When present and non-empty, a **"📥 Triage"** section is rendered below the
+bandwidth meter (and below the burn-down bar): one row per task with a
+**✅ Complete** button (`action_id: "task_complete"`, whose `value` carries
+`{taskId, text, source, link}` — the text is truncated as needed to stay
+under Slack's 2000-char button-value cap). At most **20 tasks** are rendered
+(one block each, keeping the Home view safely under Slack's 100-block
+limit); extras collapse into an "…and N more" context line.
+
+Clicking **✅ Complete** pushes a `task_complete` entry onto the delegation
+queue (see `/delegations/pending`) and best-effort re-publishes the Home
+view without that row for instant feedback; the next scheduled
+`/update-home` push is the authoritative refresh.
 - The view shows a 10-segment `█`/`░` meter of today's meeting load,
   `meeting_hours_today / (meeting_hours_today + focus_hours_today)`, with a
   plain-English read: 🟢 Light day (<34%), 🟡 Balanced (34–67%),
@@ -179,29 +226,75 @@ close-out.
 
 ### `POST /slack/interactions`
 
-Slack's interactivity endpoint (block_actions). Configure this as your Slack
-app's **Interactivity Request URL**. Verifies the request using
-`SLACK_SIGNING_SECRET` (HMAC-SHA256 over `v0:{timestamp}:{raw_body}`,
-compared to the `X-Slack-Signature` header; requests with a timestamp more
-than 5 minutes old are rejected as replays, `401`). On a valid request it
-acks with an empty `200` immediately, then asynchronously POSTs the rebuilt
-message (`{ replace_original: true, blocks, text }`) to the payload's
-`response_url`. Not meant to be called directly by anything other than Slack.
+Slack's interactivity endpoint (block_actions **and** message shortcuts).
+Configure this as your Slack app's **Interactivity Request URL**. Verifies
+the request using `SLACK_SIGNING_SECRET` (HMAC-SHA256 over
+`v0:{timestamp}:{raw_body}`, compared to the `X-Slack-Signature` header;
+requests with a timestamp more than 5 minutes old are rejected as replays,
+`401`). Not meant to be called directly by anything other than Slack. It
+handles three kinds of payloads:
+
+1. **Message-button clicks** (🔼/🔽/✅/🤖 on a brief): acks with an empty
+   `200` immediately, then asynchronously POSTs the rebuilt message
+   (`{ replace_original: true, blocks, text }`) to the payload's
+   `response_url`. A 🤖 click also queues a `type: "calendar"` delegation
+   entry.
+2. **Home-tab "✅ Complete" clicks** (`action_id: "task_complete"`): Home-tab
+   interactions arrive **without** a `response_url`, so the handler just acks
+   `200` and queues a `type: "task_complete"` entry
+   (`{taskId, text, source, link, clickedAt, status: "pending"}`). It then
+   best-effort re-publishes the current Home view minus the completed row
+   (via `views.publish`) for instant feedback — the hourly queue drain
+   re-publishes the authoritative view later regardless.
+3. **"Add to Triage" message shortcut** (`callback_id: "add_to_triage"`):
+   acks `200` and queues a `type: "triage_add"` entry
+   (`{text, channel, message_ts, permalink, clickedAt, status: "pending"}`,
+   text truncated to 300 chars; the permalink is built as
+   `https://rivian-vw-tech.slack.com/archives/<channel>/p<ts-without-dot>`).
+   No modal in v1 — categorization happens agent-side when the queue is
+   drained.
 
 ### `GET /delegations/pending`
 
-Returns the delegation-queue entries (one per "🤖 Do it" click) that are
-still awaiting an ack:
+Returns the delegation-queue entries that are still awaiting an ack. Every
+entry has a `type` field telling the consumer which click produced it:
+
+| `type` | Produced by | Extra fields |
+| --- | --- | --- |
+| `"calendar"` | 🤖 Do it on a brief recommendation | `itemId`, `text`, `link` |
+| `"task_complete"` | ✅ Complete on a Home-tab triage row | `taskId`, `text`, `source`, `link` |
+| `"triage_add"` | "Add to Triage" message shortcut | `text`, `channel`, `message_ts`, `permalink` |
 
 ```json
 {
   "items": [
     {
       "id": "6f1e2a9c-....",
+      "type": "calendar",
       "itemId": "2",
       "text": "Congratulate the team on the launch",
       "link": "https://docs.example.com/q3",
       "clickedAt": "2026-08-14T12:34:56.789Z",
+      "status": "pending"
+    },
+    {
+      "id": "a3b2c1d0-....",
+      "type": "task_complete",
+      "taskId": "t1",
+      "text": "Reply to vendor thread",
+      "source": "slack",
+      "link": null,
+      "clickedAt": "2026-08-14T13:00:00.000Z",
+      "status": "pending"
+    },
+    {
+      "id": "0d1c2b3a-....",
+      "type": "triage_add",
+      "text": "Can you own the TISAX evidence collection?",
+      "channel": "C0123456789",
+      "message_ts": "1723710000.123456",
+      "permalink": "https://rivian-vw-tech.slack.com/archives/C0123456789/p1723710000123456",
+      "clickedAt": "2026-08-14T13:05:00.000Z",
       "status": "pending"
     }
   ]
@@ -210,9 +303,12 @@ still awaiting an ack:
 
 - Auth: header `X-Internal-Secret` must match `INTERNAL_API_SECRET` (same
   scheme as `/render-brief`). Missing or wrong → `401`.
-- `id` is a server-generated UUID for the queue entry; `itemId` is the
-  recommendation's own id; `link` is recovered from the original message's
-  accessory URLs at click time (`null` when the item had no link).
+- `id` is a server-generated UUID for the queue entry; for `"calendar"`
+  entries `itemId` is the recommendation's own id and `link` is recovered
+  from the original message's accessory URLs at click time (`null` when the
+  item had no link).
+- Entries queued before the `type` field existed are reported as
+  `"calendar"`.
 
 ### `POST /delegations/ack`
 
@@ -279,6 +375,31 @@ curl http://localhost:3000/healthz
    ```
 7. Make sure the Slack app's bot token has the `chat:write` scope and the bot
    is invited to any channel it needs to post in.
+
+## Slack app config for the "Add to Triage" message shortcut
+
+In your Slack app's configuration (`https://api.slack.com/apps` → your app):
+
+1. **Interactivity & Shortcuts** → make sure Interactivity is **On** and the
+   Request URL points at `https://<your-host>/slack/interactions` (shortcuts
+   are delivered to the same URL as button clicks).
+2. **Create New Shortcut** → **On messages**:
+   - Name: `Add to Triage`
+   - Short description: e.g. `Queue this message on the triage board`
+   - Callback ID: `add_to_triage`
+3. Save — the shortcut appears in every message's "More actions" (⋯) menu.
+   Reinstall the app if Slack prompts you to.
+
+Equivalent app-manifest snippet:
+
+```yaml
+features:
+  shortcuts:
+    - name: Add to Triage
+      type: message
+      callback_id: add_to_triage
+      description: Queue this message on the triage board
+```
 
 ## Keeping /slack/interactions warm
 

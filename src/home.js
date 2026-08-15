@@ -15,11 +15,28 @@
  *      🟢 Light day (<34%), 🟡 Balanced (34-67%), 🔴 Meeting-heavy (>67%)
  *   3. a fields section: meetings today, open focus time, meetings this
  *      week, pending items, new today, on call
- *   4. one context block per `notes` line
- *   5. a final "Updated {ISO time}" context line
+ *   4. (when `burndown.baseline` > 0) a burn-down bar: 10-segment █/░ bar of
+ *      the cleared fraction, "X of Y cleared", and a "💬 N Slack | 📧 N Email"
+ *      breakdown — or a "🎉 Inbox Zero!" header when current === 0
+ *   5. (when `tasks` is a non-empty array) a "📥 Triage" board: one section
+ *      row per task (source icon + text + inline "open" link) with a
+ *      "✅ Complete" accessory button (action_id "task_complete"), capped at
+ *      MAX_TRIAGE_TASKS rows plus an "…and N more" context line
+ *   6. one context block per `notes` line
+ *   7. a final "Updated {ISO time}" context line
  */
 
 const METER_SEGMENTS = 10;
+const BURNDOWN_SEGMENTS = 10;
+
+// Slack caps a Home view at 100 blocks; each triage task costs 1 block, so
+// capping at 20 leaves ample room for the meter/fields/notes sections.
+const MAX_TRIAGE_TASKS = 20;
+
+// Slack caps a button's `value` at 2000 characters.
+const BUTTON_VALUE_MAX = 2000;
+
+const TASK_SOURCE_ICONS = { slack: "💬", email: "📧", manual: "📝" };
 
 /** True for any finite number (the only values we render as numbers). */
 function isNum(value) {
@@ -69,6 +86,142 @@ function computeMeter(meetingHours, focusHours) {
 }
 
 /**
+ * Serializes a triage task into a "task_complete" button `value` that stays
+ * within Slack's 2000-char cap, truncating the task text (and, as a last
+ * resort, dropping the link) when needed.
+ *
+ * @param {{id: string, text?: string, source?: string, link?: string}} task
+ * @returns {string} JSON string {taskId, text, source, link}
+ */
+function buildTaskValue(task) {
+  const value = {
+    taskId: task.id,
+    text: typeof task.text === "string" ? task.text : "",
+    source: task.source || "manual",
+    link: typeof task.link === "string" && task.link ? task.link : null,
+  };
+
+  let json = JSON.stringify(value);
+  while (json.length > BUTTON_VALUE_MAX && value.text.length > 0) {
+    // Chop generously and re-measure: JSON escaping means char counts don't
+    // map 1:1, so a shrink-and-recheck loop is the simple correct approach.
+    value.text = `${value.text.slice(0, Math.max(0, value.text.length - (json.length - BUTTON_VALUE_MAX) - 1))}…`;
+    json = JSON.stringify(value);
+    if (value.text === "…") break;
+  }
+  if (json.length > BUTTON_VALUE_MAX) {
+    value.link = null; // pathological link length - the queue entry loses it
+    json = JSON.stringify(value);
+  }
+  return json;
+}
+
+/**
+ * Builds the burn-down section blocks (divider + bar/celebration +
+ * breakdown). Returns [] when baseline is absent, non-numeric, or <= 0.
+ *
+ * @param {{baseline?: number, current?: number, slack_unreads?: number,
+ *          email_unreads?: number}|undefined} burndown
+ * @returns {Array<object>}
+ */
+function buildBurndownBlocks(burndown) {
+  if (!burndown || !isNum(burndown.baseline) || burndown.baseline <= 0) {
+    return [];
+  }
+
+  const baseline = burndown.baseline;
+  const current = isNum(burndown.current) ? burndown.current : baseline;
+  const blocks = [{ type: "divider" }];
+
+  if (current === 0) {
+    blocks.push({
+      type: "header",
+      text: { type: "plain_text", text: "🎉 Inbox Zero!", emoji: true },
+    });
+  } else {
+    const cleared = Math.min(1, Math.max(0, (baseline - current) / baseline));
+    const filled = Math.round(cleared * BURNDOWN_SEGMENTS);
+    const bar = "█".repeat(filled) + "░".repeat(BURNDOWN_SEGMENTS - filled);
+    const clearedCount = Math.max(0, Math.min(baseline, baseline - current));
+    blocks.push({
+      type: "section",
+      text: {
+        type: "mrkdwn",
+        text: `*🔥 Inbox burn-down*\n\`${bar}\` *${clearedCount} of ${baseline} cleared*`,
+      },
+    });
+  }
+
+  if (isNum(burndown.slack_unreads) || isNum(burndown.email_unreads)) {
+    const slackN = isNum(burndown.slack_unreads) ? burndown.slack_unreads : 0;
+    const emailN = isNum(burndown.email_unreads) ? burndown.email_unreads : 0;
+    blocks.push({
+      type: "context",
+      elements: [{ type: "mrkdwn", text: `💬 ${slackN} Slack | 📧 ${emailN} Email` }],
+    });
+  }
+
+  return blocks;
+}
+
+/**
+ * Builds the "📥 Triage" board blocks: one section row per task with a
+ * "✅ Complete" accessory button, capped at MAX_TRIAGE_TASKS with an
+ * "…and N more" context line. Returns [] when there are no valid tasks.
+ *
+ * @param {Array<{id: string, text: string, source?: string, link?: string,
+ *                status?: string}>|undefined} tasks
+ * @returns {Array<object>}
+ */
+function buildTriageBlocks(tasks) {
+  const valid = (Array.isArray(tasks) ? tasks : []).filter(
+    (task) => task && typeof task.text === "string" && task.text.trim() !== ""
+  );
+  if (valid.length === 0) return [];
+
+  const blocks = [
+    { type: "divider" },
+    {
+      type: "header",
+      text: { type: "plain_text", text: "📥 Triage", emoji: true },
+    },
+  ];
+
+  valid.slice(0, MAX_TRIAGE_TASKS).forEach((task, index) => {
+    const icon = TASK_SOURCE_ICONS[task.source] || TASK_SOURCE_ICONS.manual;
+    const doing = task.status === "doing" ? " 🔄" : "";
+    let text = `${icon}${doing} ${task.text}`;
+    if (typeof task.link === "string" && task.link) {
+      text += ` · <${task.link}|open>`;
+    }
+    blocks.push({
+      // Stable block_id lets /slack/interactions surgically remove this row
+      // from payload.view.blocks for instant feedback on ✅ Complete.
+      type: "section",
+      block_id: `task_${task.id !== undefined && task.id !== null ? task.id : index}`,
+      text: { type: "mrkdwn", text },
+      accessory: {
+        type: "button",
+        text: { type: "plain_text", text: "✅ Complete", emoji: true },
+        action_id: "task_complete",
+        value: buildTaskValue(task),
+      },
+    });
+  });
+
+  if (valid.length > MAX_TRIAGE_TASKS) {
+    blocks.push({
+      type: "context",
+      elements: [
+        { type: "mrkdwn", text: `…and ${valid.length - MAX_TRIAGE_TASKS} more` },
+      ],
+    });
+  }
+
+  return blocks;
+}
+
+/**
  * Builds the App Home view for views.publish.
  *
  * @param {object} payload - the /update-home request body (see README)
@@ -85,6 +238,8 @@ function buildHomeView(payload) {
     new_today,
     on_call,
     notes,
+    burndown,
+    tasks,
   } = payload || {};
 
   const blocks = [];
@@ -142,6 +297,12 @@ function buildHomeView(payload) {
     });
   }
 
+  // --- Burn-down bar (above triage) ----------------------------------------
+  blocks.push(...buildBurndownBlocks(burndown));
+
+  // --- Triage board ----------------------------------------------------------
+  blocks.push(...buildTriageBlocks(tasks));
+
   // --- Notes ---------------------------------------------------------------
   const noteLines = Array.isArray(notes)
     ? notes.filter((line) => typeof line === "string" && line.trim() !== "")
@@ -170,4 +331,11 @@ function buildHomeView(payload) {
   return { type: "home", blocks };
 }
 
-module.exports = { buildHomeView, computeMeter };
+module.exports = {
+  buildHomeView,
+  computeMeter,
+  buildBurndownBlocks,
+  buildTriageBlocks,
+  buildTaskValue,
+  MAX_TRIAGE_TASKS,
+};
