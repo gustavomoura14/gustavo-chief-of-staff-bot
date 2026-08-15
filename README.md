@@ -120,6 +120,63 @@ The main entrypoint (e.g. called by a scheduled routine every morning).
   ```
   This reflects Slack's actual response — it is not echoed blindly.
 
+### `POST /update-home`
+
+Publishes an **App Home "bandwidth meter"** view for a user via Slack's
+`views.publish`. Intended to be refreshed by the morning brief and the EOD
+close-out.
+
+- Auth: header `X-Internal-Secret` must match `INTERNAL_API_SECRET` (same
+  scheme as `/render-brief`). Missing or wrong → `401`.
+- Body (`Content-Type: application/json`):
+
+  | Field | Type | Meaning |
+  | --- | --- | --- |
+  | `user` | string, **required** | Slack user ID whose App Home to publish (e.g. `U0A7P92MZ8X`). |
+  | `date_label` | string | Shown in the header, e.g. `"Fri Aug 15"`. |
+  | `meeting_hours_today` | number | Hours in meetings today. |
+  | `focus_hours_today` | number | Open focus hours today. |
+  | `meetings_this_week` | number | Meeting count this week. |
+  | `meeting_hours_week` | number | Meeting hours this week. |
+  | `pending_items` | number | Open pending items. |
+  | `new_today` | number | Items new today. |
+  | `on_call` | boolean | Renders `🔴 yes` / `—`. |
+  | `notes` | string[] | Short lines, one context row each. |
+
+  **All numeric fields are optional** — only fields actually present are
+  rendered (no empty rows).
+- The view shows a 10-segment `█`/`░` meter of today's meeting load,
+  `meeting_hours_today / (meeting_hours_today + focus_hours_today)`, with a
+  plain-English read: 🟢 Light day (<34%), 🟡 Balanced (34–67%),
+  🔴 Meeting-heavy (>67%).
+- Responds with Slack's actual result: `{ "ok": true }` on success, or
+  `{ "ok": false, "error": "<slack error>" }` when Slack rejects the publish.
+- Example:
+
+  ```bash
+  curl -X POST https://<your-host>/update-home \
+    -H 'Content-Type: application/json' \
+    -H 'X-Internal-Secret: <INTERNAL_API_SECRET>' \
+    -d '{
+      "user": "U0A7P92MZ8X",
+      "date_label": "Fri Aug 15",
+      "meeting_hours_today": 4.5,
+      "focus_hours_today": 2.0,
+      "meetings_this_week": 23,
+      "meeting_hours_week": 18.5,
+      "pending_items": 7,
+      "new_today": 3,
+      "on_call": true,
+      "notes": ["TISAX evidence due Mon", "On-call until Fri 5pm"]
+    }'
+  ```
+
+> **Prerequisite — Home Tab toggle:** the Slack app's **App Home → Show Tabs
+> → Home Tab** toggle must be **ON**, or `views.publish` fails — Slack
+> returns an error like `"not_enabled_for_app_home"`. If you get any error
+> mentioning home / feature not enabled, flip that toggle in the app config
+> and retry.
+
 ### `POST /slack/interactions`
 
 Slack's interactivity endpoint (block_actions). Configure this as your Slack

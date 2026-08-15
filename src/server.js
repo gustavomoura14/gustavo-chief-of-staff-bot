@@ -11,6 +11,7 @@ const {
   REC_TEXT_BLOCK_ID_PREFIX,
 } = require("./blocks");
 const { verifySlackSignature } = require("./verify");
+const { buildHomeView } = require("./home");
 
 const app = express();
 const PORT = process.env.PORT || 3000;
@@ -98,6 +99,58 @@ app.post("/render-brief", requireInternalSecret, express.json(), async (req, res
     return res.json({ ok: false, error: slackJson.error });
   } catch (err) {
     console.error("Error posting brief to Slack:", err);
+    return res.status(502).json({ ok: false, error: "slack_request_failed" });
+  }
+});
+
+// ---------------------------------------------------------------------------
+// POST /update-home
+//
+// Publishes the App Home "bandwidth meter" view for a user via Slack's
+// views.publish. Body: { user, date_label?, meeting_hours_today?,
+// focus_hours_today?, meetings_this_week?, meeting_hours_week?,
+// pending_items?, new_today?, on_call?, notes? } - all numeric fields are
+// optional and only present fields are rendered. Protected by the same
+// X-Internal-Secret header as /render-brief. NOTE: the Slack app's
+// App Home -> Home Tab toggle must be ON, or views.publish fails (Slack
+// returns an error like "not_enabled_for_app_home") - we relay Slack's
+// response verbatim rather than faking success.
+// ---------------------------------------------------------------------------
+app.post("/update-home", requireInternalSecret, express.json(), async (req, res) => {
+  const body = req.body || {};
+
+  if (!body.user || typeof body.user !== "string") {
+    return res.status(400).json({
+      ok: false,
+      error: "bad_request",
+      message: "Expected { user, date_label?, meeting_hours_today?, focus_hours_today?, ... }",
+    });
+  }
+
+  const view = buildHomeView(body);
+
+  try {
+    const slackResponse = await fetch("https://slack.com/api/views.publish", {
+      method: "POST",
+      headers: {
+        "Content-Type": "application/json; charset=utf-8",
+        Authorization: `Bearer ${SLACK_BOT_TOKEN}`,
+      },
+      body: JSON.stringify({
+        user_id: body.user,
+        view,
+      }),
+    });
+
+    const slackJson = await slackResponse.json();
+
+    if (slackJson.ok) {
+      return res.json({ ok: true });
+    }
+
+    return res.json({ ok: false, error: slackJson.error });
+  } catch (err) {
+    console.error("Error publishing App Home view to Slack:", err);
     return res.status(502).json({ ok: false, error: "slack_request_failed" });
   }
 });
