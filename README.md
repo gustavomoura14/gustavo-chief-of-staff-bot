@@ -110,6 +110,15 @@ The main entrypoint (e.g. called by a scheduled routine every morning).
   `priority_recap`, `sections`, and `recommendations` are all optional.
   A recommendation with `delegatable: true` gets an extra "🤖 Do it" button
   (see the action semantics above); the default is `false`.
+- **Custom titles** (optional): `title` replaces the default "Morning Brief"
+  header title (e.g. `"Week Ahead"`, `"EOD Close-out"`), and `emoji` is
+  prepended when given (e.g. `"🌙"`). Rules:
+  - Neither given → the classic `☀️ Morning Brief — <date>`.
+  - `title` only → `<title> — <date>` (no default emoji is forced; the title
+    may embed its own, e.g. `"📅 Week Ahead"`).
+  - `emoji` given → `<emoji> <title-or-default> — <date>`.
+  The date stamp (`— Friday, August 14`) is always appended, and the
+  message's notification fallback `text` mirrors the rendered header.
 - Calls Slack's `chat.postMessage` and returns:
   ```json
   { "ok": true, "ts": "1700000000.000100" }
@@ -261,9 +270,14 @@ entry has a `type` field telling the consumer which click produced it:
 
 | `type` | Produced by | Extra fields |
 | --- | --- | --- |
-| `"calendar"` | 🤖 Do it on a brief recommendation | `itemId`, `text`, `link` |
+| `"calendar"` | 🤖 Do it on a brief recommendation | `itemId`, `text`, `link`, `channel`, `message_ts` |
 | `"task_complete"` | ✅ Complete on a Home-tab triage row | `taskId`, `text`, `source`, `link` |
 | `"triage_add"` | "Add to Triage" message shortcut | `text`, `channel`, `message_ts`, `permalink` |
+
+For `"calendar"` entries, `channel`/`message_ts` identify the original brief
+message the 🤖 button was clicked in (`null` on entries queued before these
+fields existed) — `/delegations/complete` uses them to strike the item out
+in that message.
 
 ```json
 {
@@ -274,6 +288,8 @@ entry has a `type` field telling the consumer which click produced it:
       "itemId": "2",
       "text": "Congratulate the team on the launch",
       "link": "https://docs.example.com/q3",
+      "channel": "C0123456789",
+      "message_ts": "1723700000.000100",
       "clickedAt": "2026-08-14T12:34:56.789Z",
       "status": "pending"
     },
@@ -322,14 +338,61 @@ Marks queue entries as handled.
   `status` must be `"done"` or `"failed"`; anything else (or a non-array
   `ids`) → `400`.
 - Responds `{ "ok": true, "updated": N }` where `N` is the number of matching
-  entries updated. Acked entries stay in memory but leave the
+  entries updated. Acked entries stay in the queue but leave the
   `/delegations/pending` list.
 
-> **Restart caveat:** the delegation queue is **in-memory only** (v1). A
-> dyno/instance restart or redeploy **drops any queued 🤖 clicks** that have
-> not been drained yet — the Slack message will still show those items as
-> "🤖 _queued: …_", but they will no longer appear in
-> `/delegations/pending`. Accepted v1 behavior; drain the queue promptly.
+### `POST /delegations/complete`
+
+Marks **one** queue entry as handled *and* reflects the outcome back into the
+original Slack message the 🤖 button was clicked in (using the entry's stored
+`channel`/`message_ts`).
+
+- Auth: header `X-Internal-Secret`, as above. Missing or wrong → `401`.
+- Body:
+  ```json
+  { "id": "6f1e2a9c-....", "status": "done", "note": "optional short text" }
+  ```
+  `id` is the delegation queue entry's id (from `/delegations/pending`).
+  `status` must be `"done"` or `"failed"` (anything else, or a missing/
+  non-string `id` → `400`; an unknown `id` → `404`).
+- The queue entry is **always marked** with the given status (same semantics
+  as `/delegations/ack` — it leaves the pending list), *regardless* of
+  whether the message update below succeeds.
+- Message update: the original message's current blocks are fetched via
+  `conversations.history` (`latest=<ts>`, `inclusive=true`, `limit=1`), the
+  item's section block is located by its stable `rec_text_<itemId>` block_id
+  (falling back to a text match on the entry's stored text), then the message
+  is rewritten via `chat.update`:
+  - `"done"` → the section text is struck through with a `✔ done — <note>`
+    suffix, and the item's `rec_actions_<itemId>` actions block (the block
+    immediately following, when it verifiably belongs to that item) is
+    removed. All other blocks are untouched.
+  - `"failed"` → the text is prefixed with `⚠️` and the note appended — no
+    strikethrough, actions kept.
+- Responds with Slack's real result: `{ "ok": true, "ts": ..., "channel": ... }`
+  on a successful `chat.update`, or `{ "ok": false, "error": "<why>" }` when
+  the message couldn't be found/updated (`no_message_reference` for entries
+  without a stored `channel`/`message_ts` — e.g. Home-tab `task_complete`
+  entries, which don't need this since the Home view is re-published by
+  routine updates anyway; `message_not_found` / `item_block_not_found` /
+  Slack's own error otherwise). **The entry is marked either way** — an
+  `ok: false` only means the visual strikeout didn't happen.
+
+## Queue durability
+
+The delegation queue lives in memory **and is mirrored to a JSON file on
+every mutation** (push, ack, complete): `<DATA_DIR>/delegations.json`, where
+`DATA_DIR` is an optional env var defaulting to the OS temp dir. On startup
+the file, if present, is loaded back. Writes are atomic (write-to-temp +
+rename) and best-effort — a persistence failure is logged but never breaks
+the queue.
+
+> **Residual risk:** this survives process restarts, crashes, and same-
+> instance redeploy restarts — but a **full instance re-provision** (e.g.
+> Render's free tier moving the service to a fresh machine/filesystem, where
+> the temp dir starts empty) still loses the file. That window is much
+> smaller than the old lose-on-every-restart behavior; for zero loss, point
+> `DATA_DIR` at a persistent disk. Drain the queue promptly regardless.
 
 ## Required environment variables
 
@@ -339,6 +402,8 @@ Marks queue entries as handled.
 | `SLACK_SIGNING_SECRET` | From your Slack app's **Basic Information** page, used to verify interactivity requests. |
 | `INTERNAL_API_SECRET` | Shared secret you choose; required in the `X-Internal-Secret` header on `/render-brief`. |
 | `PORT` | Port to listen on (Render sets this automatically; defaults to `3000` locally). |
+| `DATA_DIR` | *Optional.* Directory for the persisted delegation queue file (`delegations.json`); defaults to the OS temp dir. Point it at a persistent disk for maximum durability. |
+| `SLACK_API_BASE` | *Optional, tests only.* Overrides the Slack Web API base URL (`https://slack.com/api`) so local tests can target a mock server. Leave unset in production. |
 
 See `.env.example`.
 
@@ -423,7 +488,8 @@ interactivity request to this server for them.
 
 - No database or external state store is used, by design. All state needed
   to redraw the recommendations list travels inside the button `value`
-  payloads.
+  payloads; the only server-side state is the delegation queue, mirrored to
+  a local JSON file (see "Queue durability").
 - Uses Node's built-in `crypto` for signature verification and the global
   `fetch` (Node 18+) for calling Slack's Web API — no extra dependencies
   beyond `express`.

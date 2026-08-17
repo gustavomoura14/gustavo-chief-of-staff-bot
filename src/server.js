@@ -1,6 +1,9 @@
 "use strict";
 
 const crypto = require("crypto");
+const fs = require("fs");
+const os = require("os");
+const path = require("path");
 const express = require("express");
 const {
   buildBriefBlocks,
@@ -20,23 +23,65 @@ const SLACK_BOT_TOKEN = process.env.SLACK_BOT_TOKEN;
 const SLACK_SIGNING_SECRET = process.env.SLACK_SIGNING_SECRET;
 const INTERNAL_API_SECRET = process.env.INTERNAL_API_SECRET;
 
+// Slack Web API base URL. Overridable ONLY so local tests can point at a
+// mock server; leave unset in production.
+const SLACK_API_BASE = process.env.SLACK_API_BASE || "https://slack.com/api";
+
 // ---------------------------------------------------------------------------
-// In-memory delegation queue. Clicks push entries here; an external worker
-// drains it via GET /delegations/pending and marks entries via
-// POST /delegations/ack. Entries live ONLY in this process's memory - a
-// dyno/instance restart drops any queued clicks (accepted v1 behavior; see
-// README).
+// Delegation queue. Clicks push entries here; an external worker drains it
+// via GET /delegations/pending and marks entries via POST /delegations/ack
+// or POST /delegations/complete.
+//
+// Durability: the queue is held in memory AND mirrored to a JSON file
+// (DATA_DIR env var, defaulting to the OS temp dir) on every mutation (push,
+// ack, complete). On startup the file, if present, is loaded back - so plain
+// process restarts/crashes no longer drop queued clicks. Residual risk: a
+// full instance re-provision (e.g. Render free tier moving the service to a
+// fresh filesystem) still loses the file - see README.
 //
 // Every entry has { id, type, clickedAt, status } where status is
 // "pending" | "done" | "failed" (acks may also attach `note`/`ackedAt`) and
 // `type` is one of:
-//   - "calendar"      (🤖 Do it on a brief recommendation): + itemId, text, link
+//   - "calendar"      (🤖 Do it on a brief recommendation): + itemId, text,
+//                     link, channel, message_ts (channel/message_ts identify
+//                     the original brief message for /delegations/complete)
 //   - "task_complete" (✅ Complete on a Home-tab triage row): + taskId, text,
 //                     source, link
 //   - "triage_add"    ("Add to Triage" message shortcut): + text, channel,
 //                     message_ts, permalink
 // ---------------------------------------------------------------------------
+const DATA_DIR = process.env.DATA_DIR || os.tmpdir();
+const DELEGATIONS_FILE = path.join(DATA_DIR, "delegations.json");
+
 const delegations = [];
+try {
+  if (fs.existsSync(DELEGATIONS_FILE)) {
+    const loaded = JSON.parse(fs.readFileSync(DELEGATIONS_FILE, "utf8"));
+    if (Array.isArray(loaded)) {
+      delegations.push(...loaded);
+      console.log(`Loaded ${loaded.length} delegation entries from ${DELEGATIONS_FILE}`);
+    }
+  }
+} catch (err) {
+  console.error(`Failed to load delegation queue from ${DELEGATIONS_FILE}:`, err);
+}
+
+/**
+ * Persists the delegation queue to DELEGATIONS_FILE (write-to-temp +
+ * rename, so a crash mid-write never truncates the previous good file).
+ * Best-effort: persistence failures are logged, never thrown - the in-memory
+ * queue keeps working exactly as before.
+ */
+function saveDelegations() {
+  try {
+    fs.mkdirSync(DATA_DIR, { recursive: true });
+    const tmpFile = `${DELEGATIONS_FILE}.tmp`;
+    fs.writeFileSync(tmpFile, JSON.stringify(delegations));
+    fs.renameSync(tmpFile, DELEGATIONS_FILE);
+  } catch (err) {
+    console.error(`Failed to persist delegation queue to ${DELEGATIONS_FILE}:`, err);
+  }
+}
 
 // Workspace host used to build permalinks for "Add to Triage" shortcut
 // entries (categorization happens agent-side; the agent follows this link).
@@ -81,20 +126,28 @@ app.get("/healthz", (req, res) => {
 // form-encoded parsing below.
 // ---------------------------------------------------------------------------
 app.post("/render-brief", requireInternalSecret, express.json(), async (req, res) => {
-  const { channel, thread_ts, priority_recap, sections, recommendations } = req.body || {};
+  const { channel, thread_ts, priority_recap, sections, recommendations, title, emoji } =
+    req.body || {};
 
   if (!channel) {
     return res.status(400).json({
       ok: false,
       error: "bad_request",
-      message: "Expected { channel, thread_ts?, priority_recap?, sections?, recommendations? }",
+      message:
+        "Expected { channel, thread_ts?, priority_recap?, sections?, recommendations?, title?, emoji? }",
     });
   }
 
-  const blocks = buildBriefBlocks({ priority_recap, sections, recommendations });
+  const blocks = buildBriefBlocks({ priority_recap, sections, recommendations, title, emoji });
+
+  // Notification fallback text mirrors the rendered header (which carries
+  // the custom title/emoji and the date stamp) - the header is always the
+  // first block.
+  const fallbackText =
+    blocks[0] && blocks[0].type === "header" ? blocks[0].text.text : "Chief of Staff briefing";
 
   try {
-    const slackResponse = await fetch("https://slack.com/api/chat.postMessage", {
+    const slackResponse = await fetch(`${SLACK_API_BASE}/chat.postMessage`, {
       method: "POST",
       headers: {
         "Content-Type": "application/json; charset=utf-8",
@@ -103,7 +156,7 @@ app.post("/render-brief", requireInternalSecret, express.json(), async (req, res
       body: JSON.stringify({
         channel,
         thread_ts,
-        text: "☀️ Morning Brief",
+        text: fallbackText,
         blocks,
       }),
     });
@@ -149,7 +202,7 @@ app.post("/update-home", requireInternalSecret, express.json(), async (req, res)
   const view = buildHomeView(body);
 
   try {
-    const slackResponse = await fetch("https://slack.com/api/views.publish", {
+    const slackResponse = await fetch(`${SLACK_API_BASE}/views.publish`, {
       method: "POST",
       headers: {
         "Content-Type": "application/json; charset=utf-8",
@@ -295,6 +348,7 @@ app.post(
         clickedAt: new Date().toISOString(),
         status: "pending",
       });
+      saveDelegations();
 
       return res.status(200).end();
     }
@@ -329,6 +383,7 @@ app.post(
         clickedAt: new Date().toISOString(),
         status: "pending",
       });
+      saveDelegations();
 
       const view = payload.view;
       const userId = payload.user && payload.user.id;
@@ -344,7 +399,7 @@ app.post(
         );
         if (remaining.length < view.blocks.length) {
           try {
-            const publishResponse = await fetch("https://slack.com/api/views.publish", {
+            const publishResponse = await fetch(`${SLACK_API_BASE}/views.publish`, {
               method: "POST",
               headers: {
                 "Content-Type": "application/json; charset=utf-8",
@@ -398,9 +453,11 @@ app.post(
       }
     });
 
-    // "🤖 Do it": push the clicked item onto the in-memory delegation queue
-    // (link recovered from the message's accessory URLs above), regardless
-    // of whether the message update below succeeds.
+    // "🤖 Do it": push the clicked item onto the delegation queue (link
+    // recovered from the message's accessory URLs above), regardless of
+    // whether the message update below succeeds. `channel`/`message_ts`
+    // identify the original brief message so /delegations/complete can later
+    // strike the item out in place.
     if (action.action_id === "item_delegate") {
       const acted = items.find((item) => item && item.id === actedId);
       delegations.push({
@@ -409,9 +466,12 @@ app.post(
         itemId: actedId,
         text: acted && acted.text ? acted.text : "",
         link: (acted && acted.link) || null,
+        channel: (payload.channel && payload.channel.id) || null,
+        message_ts: (payload.message && payload.message.ts) || null,
         clickedAt: new Date().toISOString(),
         status: "pending",
       });
+      saveDelegations();
     }
 
     const responseUrl = payload.response_url;
@@ -497,8 +557,178 @@ app.post("/delegations/ack", requireInternalSecret, express.json(), (req, res) =
       updated += 1;
     }
   });
+  if (updated > 0) {
+    saveDelegations();
+  }
 
   res.json({ ok: true, updated });
+});
+
+// ---------------------------------------------------------------------------
+// POST /delegations/complete
+//
+// Body: { id: "<delegation id>", status: "done"|"failed", note?: string }.
+// Marks the single matching queue entry (same status semantics as
+// /delegations/ack), then - when the entry carries a `channel`/`message_ts`
+// reference to the original brief message (🤖 "calendar" entries do) -
+// updates that message in place:
+//   - status "done": the item's `rec_text_<itemId>` section text is struck
+//     through with a "✔ done — <note>" suffix and its `rec_actions_<itemId>`
+//     block (the one immediately following, when it belongs to that item) is
+//     removed.
+//   - status "failed": the text is prefixed with "⚠️" and the note appended
+//     (no strikethrough, actions kept).
+// The message is fetched via conversations.history (latest=ts, inclusive,
+// limit 1) and rewritten via chat.update; Slack's real result is returned.
+// If the original message can't be found/updated, the queue entry is STILL
+// marked, and { ok: false, error } tells the caller why the visual update
+// didn't happen. Protected by the same X-Internal-Secret header as
+// /render-brief.
+// ---------------------------------------------------------------------------
+const MAX_SECTION_TEXT = 2990; // Slack section text cap is 3000 chars
+
+app.post("/delegations/complete", requireInternalSecret, express.json(), async (req, res) => {
+  const { id, status, note } = req.body || {};
+
+  if (typeof id !== "string" || !id || (status !== "done" && status !== "failed")) {
+    return res.status(400).json({
+      ok: false,
+      error: "bad_request",
+      message: 'Expected { id: "<delegation id>", status: "done"|"failed", note?: string }',
+    });
+  }
+
+  const entry = delegations.find((e) => e.id === id);
+  if (!entry) {
+    return res.status(404).json({ ok: false, error: "not_found" });
+  }
+
+  // Mark the queue entry first (same as /delegations/ack) - this must stick
+  // even when the Slack message update below fails.
+  entry.status = status;
+  entry.ackedAt = new Date().toISOString();
+  if (typeof note === "string" && note) {
+    entry.note = note;
+  }
+  saveDelegations();
+
+  if (!entry.channel || !entry.message_ts) {
+    return res.json({ ok: false, error: "no_message_reference" });
+  }
+
+  try {
+    // Fetch the original message's current blocks (chat.update requires the
+    // FULL blocks array, so we read the live message rather than trusting
+    // any stale copy).
+    const historyParams = new URLSearchParams({
+      channel: entry.channel,
+      latest: entry.message_ts,
+      inclusive: "true",
+      limit: "1",
+    });
+    const historyResponse = await fetch(
+      `${SLACK_API_BASE}/conversations.history?${historyParams}`,
+      { headers: { Authorization: `Bearer ${SLACK_BOT_TOKEN}` } }
+    );
+    const historyJson = await historyResponse.json();
+
+    if (!historyJson.ok) {
+      return res.json({ ok: false, error: historyJson.error || "history_failed" });
+    }
+
+    const message =
+      Array.isArray(historyJson.messages) &&
+      historyJson.messages.find((m) => m && m.ts === entry.message_ts);
+    if (!message || !Array.isArray(message.blocks) || message.blocks.length === 0) {
+      return res.json({ ok: false, error: "message_not_found" });
+    }
+
+    // Locate the item's section block: primary key is its stable
+    // `rec_text_<itemId>` block_id; fallback is a text match on the entry's
+    // stored text (for entries queued before itemId existed).
+    const blocks = message.blocks;
+    let targetIndex = -1;
+    if (entry.itemId != null) {
+      targetIndex = blocks.findIndex(
+        (b) => b && b.block_id === `${REC_TEXT_BLOCK_ID_PREFIX}${entry.itemId}`
+      );
+    }
+    if (targetIndex === -1 && entry.text) {
+      targetIndex = blocks.findIndex(
+        (b) =>
+          b &&
+          b.type === "section" &&
+          b.text &&
+          typeof b.text.text === "string" &&
+          b.text.text.includes(entry.text)
+      );
+    }
+    if (targetIndex === -1 || !blocks[targetIndex].text) {
+      return res.json({ ok: false, error: "item_block_not_found" });
+    }
+
+    const target = blocks[targetIndex];
+    const originalText = target.text.text;
+    let newText =
+      status === "done" ? `~${originalText}~  ✔ done` : `⚠️ ${originalText}`;
+    if (typeof note === "string" && note) {
+      newText += ` — ${note}`;
+    }
+    if (newText.length > MAX_SECTION_TEXT) {
+      newText = `${newText.slice(0, MAX_SECTION_TEXT - 1)}…`;
+    }
+
+    const newBlocks = blocks.map((b, i) =>
+      i === targetIndex ? { ...b, text: { ...b.text, text: newText } } : b
+    );
+
+    // On "done", also drop the item's actions block - the block immediately
+    // following the section, but only when it verifiably belongs to this
+    // item (block_id `rec_actions_<itemId>`). Usually already gone (the 🤖
+    // click strips it), but a failed response_url update can leave it.
+    if (status === "done") {
+      let itemId = entry.itemId;
+      if (
+        itemId == null &&
+        typeof target.block_id === "string" &&
+        target.block_id.startsWith(REC_TEXT_BLOCK_ID_PREFIX)
+      ) {
+        itemId = target.block_id.slice(REC_TEXT_BLOCK_ID_PREFIX.length);
+      }
+      const next = newBlocks[targetIndex + 1];
+      if (
+        next &&
+        next.type === "actions" &&
+        itemId != null &&
+        next.block_id === `rec_actions_${itemId}`
+      ) {
+        newBlocks.splice(targetIndex + 1, 1);
+      }
+    }
+
+    const updateResponse = await fetch(`${SLACK_API_BASE}/chat.update`, {
+      method: "POST",
+      headers: {
+        "Content-Type": "application/json; charset=utf-8",
+        Authorization: `Bearer ${SLACK_BOT_TOKEN}`,
+      },
+      body: JSON.stringify({
+        channel: entry.channel,
+        ts: entry.message_ts,
+        text: message.text || "Chief of Staff briefing",
+        blocks: newBlocks,
+      }),
+    });
+    const updateJson = await updateResponse.json();
+
+    if (updateJson.ok) {
+      return res.json({ ok: true, ts: updateJson.ts, channel: updateJson.channel });
+    }
+    return res.json({ ok: false, error: updateJson.error });
+  } catch (err) {
+    console.error("Error updating original message for /delegations/complete:", err);
+    return res.status(502).json({ ok: false, error: "slack_request_failed" });
+  }
 });
 
 app.listen(PORT, () => {

@@ -150,24 +150,48 @@ function buildTitleBlock(title) {
 // Header / priority recap
 // ---------------------------------------------------------------------------
 
+const DEFAULT_BRIEF_TITLE = "Morning Brief";
+const DEFAULT_BRIEF_EMOJI = "☀️";
+
+// Slack caps header-block plain_text at 150 chars.
+const MAX_HEADER_TEXT = 150;
+
 /**
  * Date-stamped header block, e.g. "☀️ Morning Brief — Friday, August 14".
  *
+ * A custom `title` (e.g. "Week Ahead", "EOD Close-out") replaces the default
+ * "Morning Brief". A custom `emoji` is prepended when given; when only a
+ * custom title is given, NO default emoji is added (the title may carry its
+ * own). With neither, the classic "☀️ Morning Brief" is rendered. The date
+ * stamp is always appended.
+ *
  * @param {Date} [date]
+ * @param {string} [title]
+ * @param {string} [emoji]
  * @returns {object} Slack Block Kit `header` block
  */
-function buildHeaderBlock(date = new Date()) {
+function buildHeaderBlock(date = new Date(), title, emoji) {
   const dateStr = date.toLocaleDateString("en-US", {
     weekday: "long",
     month: "long",
     day: "numeric",
   });
 
+  const customTitle = title != null && String(title).trim() !== "" ? String(title).trim() : null;
+  const customEmoji = emoji != null && String(emoji).trim() !== "" ? String(emoji).trim() : null;
+
+  const headerText = [
+    customEmoji || (customTitle ? null : DEFAULT_BRIEF_EMOJI),
+    customTitle || DEFAULT_BRIEF_TITLE,
+  ]
+    .filter(Boolean)
+    .join(" ");
+
   return {
     type: "header",
     text: {
       type: "plain_text",
-      text: `☀️ Morning Brief — ${dateStr}`,
+      text: truncate(`${headerText} — ${dateStr}`, MAX_HEADER_TEXT),
       emoji: true,
     },
   };
@@ -451,12 +475,14 @@ function buildRecommendationsBlocks(recommendations) {
  * @param {string} [payload.priority_recap]
  * @param {Array<{title: string, items: Array<object>}>} [payload.sections]
  * @param {Array<{id: string, text: string, link?: string}>} [payload.recommendations]
+ * @param {string} [payload.title] - custom header title (default "Morning Brief")
+ * @param {string} [payload.emoji] - custom header emoji prefix
  * @param {Date} [date] - override for testing
  * @returns {Array<object>} full Block Kit `blocks` array
  */
-function buildBriefBlocks({ priority_recap, sections, recommendations } = {}, date) {
+function buildBriefBlocks({ priority_recap, sections, recommendations, title, emoji } = {}, date) {
   const assemble = (sectionList, recs, maxItemsPerSection) => {
-    const blocks = [buildHeaderBlock(date)];
+    const blocks = [buildHeaderBlock(date, title, emoji)];
 
     if (priority_recap) {
       blocks.push(buildPriorityRecapBlock(truncate(String(priority_recap), MAX_SECTION_TEXT - 4)));
