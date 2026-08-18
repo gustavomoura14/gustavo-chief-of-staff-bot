@@ -9,9 +9,11 @@
  * Message shape (top to bottom):
  *   1. header block - date-stamped title, e.g. "☀️ Morning Brief — Friday, August 14"
  *   2. (optional) priority_recap section, bold/italic
- *   2b. a "🎙️ Hear it" link button (actions block, action_id `voice_open`)
- *       pointing at the voice-briefing project (VOICE_PROJECT_URL env var,
- *       with a built-in default)
+ *   2b. one actions block (block_id `voice_actions`) with a "🎙️ Hear it"
+ *       link button (action_id `voice_open`) pointing at the voice-briefing
+ *       project (VOICE_PROJECT_URL env var, with a built-in default) and a
+ *       "🔄 Refresh brief" action button (action_id `brief_refresh`) that
+ *       queues a "refresh" delegation entry
  *   3. for each entry in `sections`: ONE section block containing the bold
  *      title on the first line, then one "• item" line per item (flag as an
  *      italic suffix, link as an inline `<url|open>` mrkdwn link). Items may
@@ -477,14 +479,23 @@ const DEFAULT_VOICE_PROJECT_URL =
   "https://claude.ai/project/01a016ef-9b3a-757d-bb5b-7c13adf52973";
 
 /**
- * Builds an `actions` block holding a single link button ("🎙️ Hear it")
- * pointing at the voice-briefing project. Link buttons are handled
- * client-side by Slack (the URL just opens), but Slack still fires a
- * block_actions event for them - the interactions handler acks the
- * `voice_open` action_id with an empty 200 and does nothing else.
+ * Builds an `actions` block holding two buttons in one row:
+ *   - "🎙️ Hear it" (action_id `voice_open`): a LINK button pointing at the
+ *     voice-briefing project. Link buttons are handled client-side by Slack
+ *     (the URL just opens), but Slack still fires a block_actions event for
+ *     them - the interactions handler acks `voice_open` with an empty 200
+ *     and does nothing else.
+ *   - "🔄 Refresh brief" (action_id `brief_refresh`): a REGULAR action
+ *     button (no url). The interactions handler queues a "refresh"
+ *     delegation entry and swaps this button's text/action_id in place so
+ *     it can't be queued twice from the same message.
  *
- * The URL comes from VOICE_PROJECT_URL (read at build time so tests can
- * override it), falling back to the default project URL.
+ * The voice URL comes from VOICE_PROJECT_URL (read at build time so tests
+ * can override it), falling back to the default project URL.
+ *
+ * Both buttons share ONE actions block (block_id `voice_actions`), so this
+ * still costs a single block against the ≤45/50-block message guards and
+ * the 100-block Home cap.
  *
  * @returns {object} Slack Block Kit `actions` block
  */
@@ -498,6 +509,12 @@ function buildVoiceButtonBlock() {
         action_id: "voice_open",
         text: { type: "plain_text", text: "🎙️ Hear it", emoji: true },
         url: process.env.VOICE_PROJECT_URL || DEFAULT_VOICE_PROJECT_URL,
+      },
+      {
+        type: "button",
+        action_id: "brief_refresh",
+        text: { type: "plain_text", text: "🔄 Refresh brief", emoji: true },
+        value: '{"type":"refresh"}',
       },
     ],
   };

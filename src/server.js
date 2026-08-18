@@ -49,6 +49,15 @@ const SLACK_API_BASE = process.env.SLACK_API_BASE || "https://slack.com/api";
 //                     source, link
 //   - "triage_add"    ("Add to Triage" message shortcut): + text, channel,
 //                     message_ts, permalink
+//   - "refresh"       (🔄 Refresh brief button, on briefs and the Home tab):
+//                     shaped { id: "refresh-<ms>", type, requested_at,
+//                     channel, message_ts, status } - `id` is
+//                     "refresh-" + Date.now() and `requested_at` is the ISO
+//                     click time (instead of the crypto-UUID `id` +
+//                     `clickedAt` other types use); channel/message_ts are
+//                     null for Home-tab clicks (Home block_actions carry no
+//                     message). An external sweep drains these and re-renders
+//                     the brief.
 // ---------------------------------------------------------------------------
 const DATA_DIR = process.env.DATA_DIR || os.tmpdir();
 const DELEGATIONS_FILE = path.join(DATA_DIR, "delegations.json");
@@ -425,12 +434,93 @@ app.post(
       return;
     }
 
+    // --- Brief refresh: "🔄 Refresh brief" ----------------------------------
+    // Lives in the `voice_actions` row on briefs AND on the Home tab. Queue a
+    // "refresh" delegation entry (persisted like every other type, so it
+    // survives restarts and shows in GET /delegations/pending), ack 200
+    // empty, then - message clicks only - POST to response_url rewriting
+    // JUST the voice_actions row: the refresh button's text becomes
+    // "🔄 Queued — runs on the next sweep" and its action_id is swapped to
+    // `brief_refresh_queued`, a no-op the unknown-action branch below acks,
+    // so the same message can't queue twice. The 🎙️ link button is
+    // preserved untouched. Home-tab clicks have no response_url (and no
+    // message), so they just enqueue and ack. /delegations/complete only
+    // targets `rec_text_<id>` section blocks, so it gracefully no-ops on the
+    // button row for refresh entries (the entry is still marked).
+    if (action.action_id === "brief_refresh") {
+      res.status(200).end();
+
+      const channelId = (payload.channel && payload.channel.id) || null;
+      const messageTs = (payload.message && payload.message.ts) || null;
+
+      delegations.push({
+        id: `refresh-${Date.now()}`,
+        type: "refresh",
+        requested_at: new Date().toISOString(),
+        channel: channelId,
+        message_ts: messageTs,
+        status: "pending",
+      });
+      saveDelegations();
+
+      const responseUrl = payload.response_url;
+      const originalBlocks = payload.message && payload.message.blocks;
+      if (!responseUrl || !Array.isArray(originalBlocks) || originalBlocks.length === 0) {
+        return; // Home-tab click (or no message context): enqueue-and-ack only.
+      }
+
+      const newBlocks = originalBlocks.map((block) => {
+        if (!block || block.block_id !== "voice_actions" || !Array.isArray(block.elements)) {
+          return block;
+        }
+        return {
+          ...block,
+          elements: block.elements.map((el) =>
+            el && el.action_id === "brief_refresh"
+              ? {
+                  ...el,
+                  action_id: "brief_refresh_queued",
+                  text: {
+                    type: "plain_text",
+                    text: "🔄 Queued — runs on the next sweep",
+                    emoji: true,
+                  },
+                }
+              : el
+          ),
+        };
+      });
+
+      try {
+        const updateResponse = await fetch(responseUrl, {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({
+            replace_original: true,
+            text: "Chief of Staff briefing",
+            blocks: newBlocks,
+          }),
+        });
+        if (!updateResponse.ok) {
+          console.error(
+            `response_url update after brief_refresh failed: HTTP ${updateResponse.status} ${await updateResponse
+              .text()
+              .catch(() => "")}`
+          );
+        }
+      } catch (err) {
+        console.error("Error POSTing brief_refresh button update to response_url:", err);
+      }
+      return;
+    }
+
     // --- Link buttons / unknown actions -------------------------------------
     // Link buttons (e.g. the 🎙️ "Hear it" voice_open button) are handled
     // entirely client-side by Slack - the URL opens in the browser - but
     // Slack STILL sends a block_actions event for the click. Ack it (and any
-    // other unrecognized action_id) with an empty 200 and no response_url
-    // update, so clicks never surface an error in Slack.
+    // other unrecognized action_id, e.g. the post-queue
+    // `brief_refresh_queued` no-op button) with an empty 200 and no
+    // response_url update, so clicks never surface an error in Slack.
     const KNOWN_BRIEF_ACTIONS = new Set(["item_up", "item_down", "item_done", "item_delegate"]);
     if (!KNOWN_BRIEF_ACTIONS.has(action.action_id)) {
       return res.status(200).end();
@@ -523,7 +613,7 @@ app.post(
 //
 // Returns every delegation-queue entry still awaiting an ack:
 // { items: [{ id, type, ..., clickedAt, status: "pending" }] } where `type`
-// is "calendar" | "task_complete" | "triage_add" (see the queue comment at
+// is "calendar" | "task_complete" | "triage_add" | "refresh" (see the queue comment at
 // the top of this file for per-type fields). Entries queued before the
 // `type` field existed are reported as "calendar" so consumers can always
 // distinguish. Protected by the same X-Internal-Secret header as

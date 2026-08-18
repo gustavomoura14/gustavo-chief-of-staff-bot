@@ -10,8 +10,12 @@
  *
  * View shape (top to bottom):
  *   1. header block - "📊 Bandwidth — {date_label}"
- *   1b. a "🎙️ Hear it" link button (actions block, action_id `voice_open`)
- *       pointing at the voice-briefing project
+ *   1b. one actions block (block_id `voice_actions`) with a "🎙️ Hear it"
+ *       link button (action_id `voice_open`) pointing at the voice-briefing
+ *       project and a "🔄 Refresh brief" action button (action_id
+ *       `brief_refresh`). Home-tab block_actions have no response_url, so a
+ *       refresh click from here just queues a "refresh" delegation entry and
+ *       is acked - the button is not rewritten in place
  *   2. (when meeting/focus hours are known) a 10-segment █/░ meter of
  *      today's meeting load with a percentage, plus a plain-English read:
  *      🟢 Light day (<34%), 🟡 Balanced (34-67%), 🔴 Meeting-heavy (>67%)
@@ -257,12 +261,14 @@ function buildHomeView(payload) {
     },
   });
 
-  // --- Voice-briefing link button ------------------------------------------
-  // One actions block near the top ("🎙️ Hear it", action_id `voice_open`,
-  // handled client-side by Slack via its `url`). Costs a single block, so
-  // the view stays comfortably under Slack's 100-block Home cap (worst case
-  // here is well below it: header + button + meter + fields + burn-down +
-  // 20 triage rows + notes + footer).
+  // --- Voice-briefing / refresh buttons -------------------------------------
+  // One actions block near the top: "🎙️ Hear it" (action_id `voice_open`,
+  // handled client-side by Slack via its `url`) plus "🔄 Refresh brief"
+  // (action_id `brief_refresh`, queues a "refresh" delegation entry). Both
+  // buttons share the block, so this still costs a single block and the view
+  // stays comfortably under Slack's 100-block Home cap (worst case here is
+  // well below it: header + buttons + meter + fields + burn-down + 20 triage
+  // rows + notes + footer).
   blocks.push(buildVoiceButtonBlock());
 
   // --- Today's meeting-load meter -----------------------------------------
