@@ -9,6 +9,9 @@
  * Message shape (top to bottom):
  *   1. header block - date-stamped title, e.g. "☀️ Morning Brief — Friday, August 14"
  *   2. (optional) priority_recap section, bold/italic
+ *   2b. a "🎙️ Hear it" link button (actions block, action_id `voice_open`)
+ *       pointing at the voice-briefing project (VOICE_PROJECT_URL env var,
+ *       with a built-in default)
  *   3. for each entry in `sections`: ONE section block containing the bold
  *      title on the first line, then one "• item" line per item (flag as an
  *      italic suffix, link as an inline `<url|open>` mrkdwn link). Items may
@@ -467,6 +470,40 @@ function buildRecommendationsBlocks(recommendations) {
 }
 
 // ---------------------------------------------------------------------------
+// Voice briefing link button
+// ---------------------------------------------------------------------------
+
+const DEFAULT_VOICE_PROJECT_URL =
+  "https://claude.ai/project/01a016ef-9b3a-757d-bb5b-7c13adf52973";
+
+/**
+ * Builds an `actions` block holding a single link button ("🎙️ Hear it")
+ * pointing at the voice-briefing project. Link buttons are handled
+ * client-side by Slack (the URL just opens), but Slack still fires a
+ * block_actions event for them - the interactions handler acks the
+ * `voice_open` action_id with an empty 200 and does nothing else.
+ *
+ * The URL comes from VOICE_PROJECT_URL (read at build time so tests can
+ * override it), falling back to the default project URL.
+ *
+ * @returns {object} Slack Block Kit `actions` block
+ */
+function buildVoiceButtonBlock() {
+  return {
+    type: "actions",
+    block_id: "voice_actions",
+    elements: [
+      {
+        type: "button",
+        action_id: "voice_open",
+        text: { type: "plain_text", text: "🎙️ Hear it", emoji: true },
+        url: process.env.VOICE_PROJECT_URL || DEFAULT_VOICE_PROJECT_URL,
+      },
+    ],
+  };
+}
+
+// ---------------------------------------------------------------------------
 // Full message assembly
 // ---------------------------------------------------------------------------
 
@@ -487,6 +524,11 @@ function buildBriefBlocks({ priority_recap, sections, recommendations, title, em
     if (priority_recap) {
       blocks.push(buildPriorityRecapBlock(truncate(String(priority_recap), MAX_SECTION_TEXT - 4)));
     }
+
+    // Voice-briefing link button, right after the header/recap and before the
+    // sections. Built inside assemble() so it counts toward the ≤45-block
+    // guard below like every other block.
+    blocks.push(buildVoiceButtonBlock());
 
     sectionList.forEach((section, index) => {
       blocks.push(...buildSectionBlocks(section, maxItemsPerSection));
@@ -614,6 +656,7 @@ module.exports = {
   buildItemSectionBlock,
   buildTitleBlock,
   buildSectionBlocks,
+  buildVoiceButtonBlock,
   buildRecommendationsBlocks,
   buildBriefBlocks,
   applyAction,

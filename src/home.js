@@ -10,6 +10,8 @@
  *
  * View shape (top to bottom):
  *   1. header block - "📊 Bandwidth — {date_label}"
+ *   1b. a "🎙️ Hear it" link button (actions block, action_id `voice_open`)
+ *       pointing at the voice-briefing project
  *   2. (when meeting/focus hours are known) a 10-segment █/░ meter of
  *      today's meeting load with a percentage, plus a plain-English read:
  *      🟢 Light day (<34%), 🟡 Balanced (34-67%), 🔴 Meeting-heavy (>67%)
@@ -25,6 +27,8 @@
  *   6. one context block per `notes` line
  *   7. a final "Updated {ISO time}" context line
  */
+
+const { buildVoiceButtonBlock } = require("./blocks");
 
 const METER_SEGMENTS = 10;
 const BURNDOWN_SEGMENTS = 10;
@@ -252,6 +256,14 @@ function buildHomeView(payload) {
       emoji: true,
     },
   });
+
+  // --- Voice-briefing link button ------------------------------------------
+  // One actions block near the top ("🎙️ Hear it", action_id `voice_open`,
+  // handled client-side by Slack via its `url`). Costs a single block, so
+  // the view stays comfortably under Slack's 100-block Home cap (worst case
+  // here is well below it: header + button + meter + fields + burn-down +
+  // 20 triage rows + notes + footer).
+  blocks.push(buildVoiceButtonBlock());
 
   // --- Today's meeting-load meter -----------------------------------------
   const meter = computeMeter(meeting_hours_today, focus_hours_today);

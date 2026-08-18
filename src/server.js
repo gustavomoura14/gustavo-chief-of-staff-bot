@@ -425,6 +425,17 @@ app.post(
       return;
     }
 
+    // --- Link buttons / unknown actions -------------------------------------
+    // Link buttons (e.g. the 🎙️ "Hear it" voice_open button) are handled
+    // entirely client-side by Slack - the URL opens in the browser - but
+    // Slack STILL sends a block_actions event for the click. Ack it (and any
+    // other unrecognized action_id) with an empty 200 and no response_url
+    // update, so clicks never surface an error in Slack.
+    const KNOWN_BRIEF_ACTIONS = new Set(["item_up", "item_down", "item_done", "item_delegate"]);
+    if (!KNOWN_BRIEF_ACTIONS.has(action.action_id)) {
+      return res.status(200).end();
+    }
+
     let decoded;
     try {
       decoded = JSON.parse(action.value);
