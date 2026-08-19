@@ -28,6 +28,10 @@
  *      row per task (source icon + text + inline "open" link) with a
  *      "✅ Complete" accessory button (action_id "task_complete"), capped at
  *      MAX_TRIAGE_TASKS rows plus an "…and N more" context line
+ *   5b. (when `delegated` is a non-empty array) a "🙋 Delegated" section:
+ *      one line per item - "🟢/🟡/🔴 <text> → <to> (<days>d)" with an inline
+ *      "open" link when present - capped at MAX_DELEGATED_ITEMS items.
+ *      Missing/empty `delegated` omits the section entirely
  *   6. one context block per `notes` line
  *   7. a final "Updated {ISO time}" context line
  */
@@ -45,6 +49,13 @@ const MAX_TRIAGE_TASKS = 20;
 const BUTTON_VALUE_MAX = 2000;
 
 const TASK_SOURCE_ICONS = { slack: "💬", email: "📧", manual: "📝" };
+
+// "🙋 Delegated" section limits/icons.
+const MAX_DELEGATED_ITEMS = 15;
+const DELEGATED_STATUS_ICONS = { green: "🟢", yellow: "🟡", red: "🔴" };
+
+// Slack caps a section block's text at 3000 chars; leave headroom.
+const MAX_DELEGATED_SECTION_TEXT = 2990;
 
 /** True for any finite number (the only values we render as numbers). */
 function isNum(value) {
@@ -230,6 +241,70 @@ function buildTriageBlocks(tasks) {
 }
 
 /**
+ * Builds the "🙋 Delegated" section blocks: divider + header + ONE section
+ * block with one line per item — "🟢/🟡/🔴 <text> → <to> (<days>d)" with an
+ * inline "open" link when present — capped at MAX_DELEGATED_ITEMS with an
+ * "…and N more" context line. `to` values that look like Slack user IDs
+ * (U…/W…) render as <@id> mentions; anything else renders verbatim. Returns
+ * [] when there are no valid items, so a missing/empty `delegated` payload
+ * field omits the section entirely.
+ *
+ * @param {Array<{text: string, to?: string, status?: "green"|"yellow"|"red",
+ *                link?: string, days?: number}>|undefined} delegated
+ * @returns {Array<object>}
+ */
+function buildDelegatedBlocks(delegated) {
+  const valid = (Array.isArray(delegated) ? delegated : []).filter(
+    (item) => item && typeof item.text === "string" && item.text.trim() !== ""
+  );
+  if (valid.length === 0) return [];
+
+  const lines = valid.slice(0, MAX_DELEGATED_ITEMS).map((item) => {
+    const icon = DELEGATED_STATUS_ICONS[item.status] || "⚪";
+    let to = typeof item.to === "string" && item.to.trim() !== "" ? item.to.trim() : "?";
+    if (/^[UW][A-Z0-9]{4,}$/.test(to)) {
+      to = `<@${to}>`;
+    }
+    let line = `${icon} ${item.text} → ${to}`;
+    if (isNum(item.days)) {
+      line += ` (${item.days}d)`;
+    }
+    if (typeof item.link === "string" && item.link) {
+      line += ` · <${item.link}|open>`;
+    }
+    return line;
+  });
+
+  let text = lines.join("\n");
+  if (text.length > MAX_DELEGATED_SECTION_TEXT) {
+    text = `${text.slice(0, MAX_DELEGATED_SECTION_TEXT - 1)}…`;
+  }
+
+  const blocks = [
+    { type: "divider" },
+    {
+      type: "header",
+      text: { type: "plain_text", text: "🙋 Delegated", emoji: true },
+    },
+    {
+      type: "section",
+      text: { type: "mrkdwn", text },
+    },
+  ];
+
+  if (valid.length > MAX_DELEGATED_ITEMS) {
+    blocks.push({
+      type: "context",
+      elements: [
+        { type: "mrkdwn", text: `…and ${valid.length - MAX_DELEGATED_ITEMS} more` },
+      ],
+    });
+  }
+
+  return blocks;
+}
+
+/**
  * Builds the App Home view for views.publish.
  *
  * @param {object} payload - the /update-home request body (see README)
@@ -248,6 +323,7 @@ function buildHomeView(payload) {
     notes,
     burndown,
     tasks,
+    delegated,
   } = payload || {};
 
   const blocks = [];
@@ -321,6 +397,9 @@ function buildHomeView(payload) {
   // --- Triage board ----------------------------------------------------------
   blocks.push(...buildTriageBlocks(tasks));
 
+  // --- Delegated items (after the triage board) ------------------------------
+  blocks.push(...buildDelegatedBlocks(delegated));
+
   // --- Notes ---------------------------------------------------------------
   const noteLines = Array.isArray(notes)
     ? notes.filter((line) => typeof line === "string" && line.trim() !== "")
@@ -354,6 +433,8 @@ module.exports = {
   computeMeter,
   buildBurndownBlocks,
   buildTriageBlocks,
+  buildDelegatedBlocks,
   buildTaskValue,
   MAX_TRIAGE_TASKS,
+  MAX_DELEGATED_ITEMS,
 };

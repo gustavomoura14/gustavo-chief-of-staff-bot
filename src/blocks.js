@@ -27,7 +27,9 @@
  *      a stable `rec_text_<id>` block_id. The actions half carries three
  *      buttons - 🔼 (item_up), 🔽 (item_down), ✅ (item_done) - plus a
  *      fourth "🤖 Do it" button (item_delegate) when the recommendation is
- *      marked `delegatable: true`. Button `value` is a JSON string of
+ *      marked `delegatable: true`, a "📌 Park for 1:1" button (item_park,
+ *      static value), and a "🙋 Delegate to..." users_select
+ *      (item_delegate_person, no value). Button `value` is a JSON string of
  *      `{ items: [...all current recommendations, in order...], actedId }`,
  *      so the whole ordered list travels with every click. No DB, no
  *      server-side state. To stay under Slack's 2000-char limit on button
@@ -417,6 +419,32 @@ function buildRecommendationPairBlocks(allRecommendations, recommendation, rank,
   if (isDelegatable(recommendation)) {
     elements.push(button("item_delegate", "🤖 Do it"));
   }
+
+  // "📌 Park for 1:1" (action_id `item_park`): parks the item for the next
+  // 1:1 - the interactions handler queues a "park" delegation entry, appends
+  // "→ 📌 parked for next 1:1" to the item's text, and removes this actions
+  // row. The value is a static marker (NOT the {items, actedId} payload) -
+  // the handler recovers the item's text from the sibling buttons' values
+  // and its link from the rec_text_<id> accessory URL.
+  elements.push({
+    type: "button",
+    action_id: "item_park",
+    text: { type: "plain_text", text: "📌 Park for 1:1", emoji: true },
+    value: '{"type":"park"}',
+  });
+
+  // "🙋 Delegate to..." user picker (action_id `item_delegate_person`):
+  // selecting a person queues a "delegated_to" delegation entry. It carries
+  // no value - Slack sends selected_user plus the block context, and the
+  // interactions handler recovers the item's text/link from the sibling
+  // buttons' values / the rec_text_<id> accessory URL. Row element count
+  // stays at most 6 (🔼🔽✅🤖📌 + this), well under Slack's 25-element cap
+  // on actions blocks.
+  elements.push({
+    type: "users_select",
+    action_id: "item_delegate_person",
+    placeholder: { type: "plain_text", text: "🙋 Delegate to...", emoji: true },
+  });
 
   return [
     sectionBlock,

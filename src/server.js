@@ -49,6 +49,13 @@ const SLACK_API_BASE = process.env.SLACK_API_BASE || "https://slack.com/api";
 //                     source, link
 //   - "triage_add"    ("Add to Triage" message shortcut): + text, channel,
 //                     message_ts, permalink
+//   - "delegated_to"  (🙋 "Delegate to..." users_select on a brief
+//                     recommendation): shaped { id: "delegated-<ms>", type,
+//                     text, link, to_user_id (the selected Slack user id),
+//                     clickedAt, status, channel, message_ts }
+//   - "park"          (📌 "Park for 1:1" on a brief recommendation): shaped
+//                     { id: "park-<ms>", type, text, link, clickedAt,
+//                     status, channel, message_ts }
 //   - "refresh"       (🔄 Refresh brief button, on briefs and the Home tab):
 //                     shaped { id: "refresh-<ms>", type, requested_at,
 //                     channel, message_ts, status } - `id` is
@@ -189,7 +196,8 @@ app.post("/render-brief", requireInternalSecret, express.json(), async (req, res
 // Publishes the App Home "bandwidth meter" view for a user via Slack's
 // views.publish. Body: { user, date_label?, meeting_hours_today?,
 // focus_hours_today?, meetings_this_week?, meeting_hours_week?,
-// pending_items?, new_today?, on_call?, notes?, burndown?, tasks? } - all
+// pending_items?, new_today?, on_call?, notes?, burndown?, tasks?,
+// delegated? } - all
 // fields except `user` are optional and only present fields are rendered
 // (see src/home.js / README for the burndown + triage-task shapes). Protected by the same
 // X-Internal-Secret header as /render-brief. NOTE: the Slack app's
@@ -244,7 +252,26 @@ app.post("/update-home", requireInternalSecret, express.json(), async (req, res)
 // verify Slack's request signature, so we capture it via a `verify` callback
 // on express.urlencoded() before it gets parsed. This body parser is scoped
 // to this route only - it never touches /render-brief's JSON parsing.
+//
+// Body-size limit: express.urlencoded defaults to 100kb, and Slack's
+// block_actions payload embeds the FULL original message blocks (plus the
+// {items,...} JSON in every button value) - a large brief pushes the payload
+// past 100kb, making the parser reject the request with HTTP 413 before the
+// handler ever runs. Slack then shows "This app responded with Status Code
+// 413" on EVERY interactive element of that message. The limit is raised to
+// 2mb; the `verify` raw-body capture runs inside this same parser, so it
+// inherits the same limit and signature verification is unaffected.
+//
+// ACK-FIRST: the handler responds 200 immediately after signature
+// verification + payload parse, then performs ALL processing (queue writes,
+// Slack API calls, response_url POSTs) asynchronously in
+// processInteraction() via setImmediate. This keeps us inside Slack's
+// 3-second interactivity deadline ("Operation timed out") regardless of how
+// long the follow-up work takes. processInteraction NEVER touches the
+// response object - failures are logged, not returned.
 // ---------------------------------------------------------------------------
+const INTERACTIONS_BODY_LIMIT = "2mb";
+
 const captureRawBody = (req, res, buf) => {
   req.rawBody = buf;
 };
@@ -305,10 +332,101 @@ function extractRecLinks(originalBlocks) {
   return linkById;
 }
 
+/** Stable block_id prefix of each recommendation's buttons row (see blocks.js). */
+const REC_ACTIONS_BLOCK_ID_PREFIX = "rec_actions_";
+
+/**
+ * Recovers a recommendation's { itemId, text, link } from the original
+ * message blocks, given the clicked element's actions-block block_id
+ * (`rec_actions_<id>`). Used by the 📌 Park and 🙋 Delegate-to-person
+ * elements, whose own values do NOT carry the {items, actedId} payload:
+ * the text comes from a sibling 🔼/🔽/✅/🤖 button's value JSON, falling
+ * back to the item's `rec_text_<id>` section text minus its "*N.* " rank
+ * prefix; the link comes from that section's accessory URL (links never
+ * travel in button values - see extractRecLinks). Returns null when the
+ * click didn't come from a rec_actions_<id> block.
+ *
+ * @param {Array<object>|undefined} originalBlocks - payload.message.blocks
+ * @param {string|undefined} actionsBlockId - the clicked element's block_id
+ * @returns {{itemId: string, text: string, link: string|null}|null}
+ */
+function recoverRecItem(originalBlocks, actionsBlockId) {
+  if (
+    typeof actionsBlockId !== "string" ||
+    !actionsBlockId.startsWith(REC_ACTIONS_BLOCK_ID_PREFIX)
+  ) {
+    return null;
+  }
+  const itemId = actionsBlockId.slice(REC_ACTIONS_BLOCK_ID_PREFIX.length);
+  const blocks = Array.isArray(originalBlocks) ? originalBlocks : [];
+
+  let text = "";
+  const actionsBlock = blocks.find((b) => b && b.block_id === actionsBlockId);
+  if (actionsBlock && Array.isArray(actionsBlock.elements)) {
+    for (const el of actionsBlock.elements) {
+      if (!el || el.type !== "button" || typeof el.value !== "string") continue;
+      try {
+        const decoded = JSON.parse(el.value);
+        const item = Array.isArray(decoded && decoded.items)
+          ? decoded.items.find((i) => i && i.id === itemId)
+          : null;
+        if (item && typeof item.text === "string" && item.text) {
+          text = item.text;
+          break;
+        }
+      } catch (err) {
+        // Not an {items} payload (e.g. the 📌 button's static value) - keep looking.
+      }
+    }
+  }
+  if (!text) {
+    const sectionBlock = blocks.find(
+      (b) => b && b.block_id === `${REC_TEXT_BLOCK_ID_PREFIX}${itemId}`
+    );
+    if (sectionBlock && sectionBlock.text && typeof sectionBlock.text.text === "string") {
+      text = sectionBlock.text.text.replace(/^\*\d+\.\*\s*/, "");
+    }
+  }
+
+  return { itemId, text, link: extractRecLinks(blocks)[itemId] || null };
+}
+
+/**
+ * POSTs a replace_original message update to a block_actions response_url.
+ * Failures are logged with `context` (the acting action_id), never thrown -
+ * by the time this runs the interaction has long been acked.
+ *
+ * @param {string} responseUrl
+ * @param {Array<object>} blocks
+ * @param {string} context
+ */
+async function postResponseUrlUpdate(responseUrl, blocks, context) {
+  try {
+    const updateResponse = await fetch(responseUrl, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({
+        replace_original: true,
+        text: "Chief of Staff briefing",
+        blocks,
+      }),
+    });
+    if (!updateResponse.ok) {
+      console.error(
+        `response_url update after ${context} failed: HTTP ${updateResponse.status} ${await updateResponse
+          .text()
+          .catch(() => "")}`
+      );
+    }
+  } catch (err) {
+    console.error(`Error POSTing ${context} update to response_url:`, err);
+  }
+}
+
 app.post(
   "/slack/interactions",
-  express.urlencoded({ extended: false, verify: captureRawBody }),
-  async (req, res) => {
+  express.urlencoded({ extended: false, limit: INTERACTIONS_BODY_LIMIT, verify: captureRawBody }),
+  (req, res) => {
     const timestamp = req.get("X-Slack-Request-Timestamp");
     const signature = req.get("X-Slack-Signature");
 
@@ -330,283 +448,376 @@ app.post(
       return res.status(400).json({ ok: false, error: "bad_payload" });
     }
 
-    // --- Message shortcut: "Add to Triage" ---------------------------------
-    // A message shortcut payload (type "message_action") has no `actions`
-    // array and no message to update - just ack 200 and queue a "triage_add"
-    // entry. Categorization happens agent-side when the queue is drained.
-    if (payload && payload.type === "message_action") {
-      if (payload.callback_id !== "add_to_triage") {
-        return res.status(200).end(); // unknown shortcut - ack and ignore
-      }
-
-      const channelId = payload.channel && payload.channel.id;
-      const messageTs = payload.message && payload.message.ts;
-      const rawText = (payload.message && payload.message.text) || "";
-      const text =
-        rawText.length > TRIAGE_ADD_TEXT_MAX
-          ? `${rawText.slice(0, TRIAGE_ADD_TEXT_MAX - 1)}…`
-          : rawText;
-
-      delegations.push({
-        id: crypto.randomUUID(),
-        type: "triage_add",
-        text,
-        channel: channelId || null,
-        message_ts: messageTs || null,
-        permalink: buildPermalink(channelId, messageTs),
-        clickedAt: new Date().toISOString(),
-        status: "pending",
-      });
-      saveDelegations();
-
-      return res.status(200).end();
-    }
-
-    const action = payload && payload.actions && payload.actions[0];
-    if (!action) {
-      return res.status(400).json({ ok: false, error: "no_action" });
-    }
-
-    // --- Home-tab triage: "✅ Complete" -------------------------------------
-    // Home-tab block_actions arrive WITHOUT a response_url. Ack 200, queue a
-    // "task_complete" entry, then (best-effort) re-publish the Home view
-    // minus the completed row via views.publish for instant feedback - the
-    // hourly drain re-publishes the authoritative view later anyway.
-    if (action.action_id === "task_complete") {
-      let task;
-      try {
-        task = JSON.parse(action.value);
-      } catch (err) {
-        return res.status(400).json({ ok: false, error: "bad_action_value" });
-      }
-
-      res.status(200).end();
-
-      delegations.push({
-        id: crypto.randomUUID(),
-        type: "task_complete",
-        taskId: task.taskId !== undefined ? task.taskId : null,
-        text: task.text || "",
-        source: task.source || "manual",
-        link: task.link || null,
-        clickedAt: new Date().toISOString(),
-        status: "pending",
-      });
-      saveDelegations();
-
-      const view = payload.view;
-      const userId = payload.user && payload.user.id;
-      if (
-        view &&
-        view.type === "home" &&
-        Array.isArray(view.blocks) &&
-        userId &&
-        task.taskId !== undefined
-      ) {
-        const remaining = view.blocks.filter(
-          (block) => !(block && block.block_id === `task_${task.taskId}`)
-        );
-        if (remaining.length < view.blocks.length) {
-          try {
-            const publishResponse = await fetch(`${SLACK_API_BASE}/views.publish`, {
-              method: "POST",
-              headers: {
-                "Content-Type": "application/json; charset=utf-8",
-                Authorization: `Bearer ${SLACK_BOT_TOKEN}`,
-              },
-              body: JSON.stringify({
-                user_id: userId,
-                view: { type: "home", blocks: remaining },
-              }),
-            });
-            const publishJson = await publishResponse.json().catch(() => ({}));
-            if (!publishJson.ok) {
-              console.error(
-                `Best-effort Home re-publish after task_complete failed: ${publishJson.error}`
-              );
-            }
-          } catch (err) {
-            console.error("Error re-publishing Home view after task_complete:", err);
-          }
-        }
-      }
-
-      return;
-    }
-
-    // --- Brief refresh: "🔄 Refresh brief" ----------------------------------
-    // Lives in the `voice_actions` row on briefs AND on the Home tab. Queue a
-    // "refresh" delegation entry (persisted like every other type, so it
-    // survives restarts and shows in GET /delegations/pending), ack 200
-    // empty, then - message clicks only - POST to response_url rewriting
-    // JUST the voice_actions row: the refresh button's text becomes
-    // "🔄 Queued — runs on the next sweep" and its action_id is swapped to
-    // `brief_refresh_queued`, a no-op the unknown-action branch below acks,
-    // so the same message can't queue twice. The 🎙️ link button is
-    // preserved untouched. Home-tab clicks have no response_url (and no
-    // message), so they just enqueue and ack. /delegations/complete only
-    // targets `rec_text_<id>` section blocks, so it gracefully no-ops on the
-    // button row for refresh entries (the entry is still marked).
-    if (action.action_id === "brief_refresh") {
-      res.status(200).end();
-
-      const channelId = (payload.channel && payload.channel.id) || null;
-      const messageTs = (payload.message && payload.message.ts) || null;
-
-      delegations.push({
-        id: `refresh-${Date.now()}`,
-        type: "refresh",
-        requested_at: new Date().toISOString(),
-        channel: channelId,
-        message_ts: messageTs,
-        status: "pending",
-      });
-      saveDelegations();
-
-      const responseUrl = payload.response_url;
-      const originalBlocks = payload.message && payload.message.blocks;
-      if (!responseUrl || !Array.isArray(originalBlocks) || originalBlocks.length === 0) {
-        return; // Home-tab click (or no message context): enqueue-and-ack only.
-      }
-
-      const newBlocks = originalBlocks.map((block) => {
-        if (!block || block.block_id !== "voice_actions" || !Array.isArray(block.elements)) {
-          return block;
-        }
-        return {
-          ...block,
-          elements: block.elements.map((el) =>
-            el && el.action_id === "brief_refresh"
-              ? {
-                  ...el,
-                  action_id: "brief_refresh_queued",
-                  text: {
-                    type: "plain_text",
-                    text: "🔄 Queued — runs on the next sweep",
-                    emoji: true,
-                  },
-                }
-              : el
-          ),
-        };
-      });
-
-      try {
-        const updateResponse = await fetch(responseUrl, {
-          method: "POST",
-          headers: { "Content-Type": "application/json" },
-          body: JSON.stringify({
-            replace_original: true,
-            text: "Chief of Staff briefing",
-            blocks: newBlocks,
-          }),
-        });
-        if (!updateResponse.ok) {
-          console.error(
-            `response_url update after brief_refresh failed: HTTP ${updateResponse.status} ${await updateResponse
-              .text()
-              .catch(() => "")}`
-          );
-        }
-      } catch (err) {
-        console.error("Error POSTing brief_refresh button update to response_url:", err);
-      }
-      return;
-    }
-
-    // --- Link buttons / unknown actions -------------------------------------
-    // Link buttons (e.g. the 🎙️ "Hear it" voice_open button) are handled
-    // entirely client-side by Slack - the URL opens in the browser - but
-    // Slack STILL sends a block_actions event for the click. Ack it (and any
-    // other unrecognized action_id, e.g. the post-queue
-    // `brief_refresh_queued` no-op button) with an empty 200 and no
-    // response_url update, so clicks never surface an error in Slack.
-    const KNOWN_BRIEF_ACTIONS = new Set(["item_up", "item_down", "item_done", "item_delegate"]);
-    if (!KNOWN_BRIEF_ACTIONS.has(action.action_id)) {
-      return res.status(200).end();
-    }
-
-    let decoded;
-    try {
-      decoded = JSON.parse(action.value);
-    } catch (err) {
-      return res.status(400).json({ ok: false, error: "bad_action_value" });
-    }
-
-    const { items, actedId } = decoded;
-    if (!Array.isArray(items) || !actedId) {
-      return res.status(400).json({ ok: false, error: "bad_action_value" });
-    }
-
-    // Ack immediately with an empty 200. Slack IGNORES the ack body for
-    // block_actions message updates - the update must instead be POSTed to
-    // the payload's response_url. Acking first keeps us inside Slack's 3s
-    // deadline regardless of how long that follow-up POST takes.
+    // ACK FIRST: everything past this point runs after the response - no
+    // code below may touch `res`.
     res.status(200).end();
 
-    const originalBlocks = payload.message && payload.message.blocks;
-
-    // Re-attach links (not carried in button values) from the original blocks.
-    const linkById = extractRecLinks(originalBlocks);
-    items.forEach((item) => {
-      if (item && !item.link && linkById[item.id]) {
-        item.link = linkById[item.id];
-      }
-    });
-
-    // "🤖 Do it": push the clicked item onto the delegation queue (link
-    // recovered from the message's accessory URLs above), regardless of
-    // whether the message update below succeeds. `channel`/`message_ts`
-    // identify the original brief message so /delegations/complete can later
-    // strike the item out in place.
-    if (action.action_id === "item_delegate") {
-      const acted = items.find((item) => item && item.id === actedId);
-      delegations.push({
-        id: crypto.randomUUID(),
-        type: "calendar",
-        itemId: actedId,
-        text: acted && acted.text ? acted.text : "",
-        link: (acted && acted.link) || null,
-        channel: (payload.channel && payload.channel.id) || null,
-        message_ts: (payload.message && payload.message.ts) || null,
-        clickedAt: new Date().toISOString(),
-        status: "pending",
+    setImmediate(() => {
+      processInteraction(payload).catch((err) => {
+        console.error("Error processing Slack interaction:", err);
       });
-      saveDelegations();
+    });
+  }
+);
+
+/**
+ * Does all the actual interaction work AFTER the 200 ack (see the route
+ * above). Must never touch the HTTP response - malformed payloads and
+ * downstream failures are logged and swallowed.
+ *
+ * @param {object} payload - the parsed Slack interactivity payload
+ */
+async function processInteraction(payload) {
+  // --- Message shortcut: "Add to Triage" ---------------------------------
+  // A message shortcut payload (type "message_action") has no `actions`
+  // array and no message to update - just queue a "triage_add" entry.
+  // Categorization happens agent-side when the queue is drained.
+  if (payload && payload.type === "message_action") {
+    if (payload.callback_id !== "add_to_triage") {
+      return; // unknown shortcut - already acked; ignore
     }
 
-    const responseUrl = payload.response_url;
-    if (!responseUrl) {
-      console.error("block_actions payload had no response_url; cannot update message");
+    const channelId = payload.channel && payload.channel.id;
+    const messageTs = payload.message && payload.message.ts;
+    const rawText = (payload.message && payload.message.text) || "";
+    const text =
+      rawText.length > TRIAGE_ADD_TEXT_MAX
+        ? `${rawText.slice(0, TRIAGE_ADD_TEXT_MAX - 1)}…`
+        : rawText;
+
+    delegations.push({
+      id: crypto.randomUUID(),
+      type: "triage_add",
+      text,
+      channel: channelId || null,
+      message_ts: messageTs || null,
+      permalink: buildPermalink(channelId, messageTs),
+      clickedAt: new Date().toISOString(),
+      status: "pending",
+    });
+    saveDelegations();
+
+    return;
+  }
+
+  const action = payload && payload.actions && payload.actions[0];
+  if (!action) {
+    console.error("Interaction payload carried no actions - nothing to do");
+    return;
+  }
+
+  // --- Home-tab triage: "✅ Complete" -------------------------------------
+  // Home-tab block_actions arrive WITHOUT a response_url. Queue a
+  // "task_complete" entry, then (best-effort) re-publish the Home view
+  // minus the completed row via views.publish for instant feedback - the
+  // hourly drain re-publishes the authoritative view later anyway.
+  if (action.action_id === "task_complete") {
+    let task;
+    try {
+      task = JSON.parse(action.value);
+    } catch (err) {
+      console.error("task_complete click carried an unparseable value - ignoring");
       return;
     }
 
-    const newItems = applyAction(items, actedId, action.action_id);
-    const newRecsBlocks = buildRecommendationsBlocks(newItems);
-    const newBlocks = mergeUpdatedBlocks(originalBlocks, newRecsBlocks);
+    delegations.push({
+      id: crypto.randomUUID(),
+      type: "task_complete",
+      taskId: task.taskId !== undefined ? task.taskId : null,
+      text: task.text || "",
+      source: task.source || "manual",
+      link: task.link || null,
+      clickedAt: new Date().toISOString(),
+      status: "pending",
+    });
+    saveDelegations();
 
-    try {
-      const updateResponse = await fetch(responseUrl, {
-        method: "POST",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({
-          replace_original: true,
-          text: "Chief of Staff briefing",
-          blocks: newBlocks,
-        }),
-      });
-      if (!updateResponse.ok) {
-        console.error(
-          `response_url update failed: HTTP ${updateResponse.status} ${await updateResponse
-            .text()
-            .catch(() => "")}`
-        );
+    const view = payload.view;
+    const userId = payload.user && payload.user.id;
+    if (
+      view &&
+      view.type === "home" &&
+      Array.isArray(view.blocks) &&
+      userId &&
+      task.taskId !== undefined
+    ) {
+      const remaining = view.blocks.filter(
+        (block) => !(block && block.block_id === `task_${task.taskId}`)
+      );
+      if (remaining.length < view.blocks.length) {
+        try {
+          const publishResponse = await fetch(`${SLACK_API_BASE}/views.publish`, {
+            method: "POST",
+            headers: {
+              "Content-Type": "application/json; charset=utf-8",
+              Authorization: `Bearer ${SLACK_BOT_TOKEN}`,
+            },
+            body: JSON.stringify({
+              user_id: userId,
+              view: { type: "home", blocks: remaining },
+            }),
+          });
+          const publishJson = await publishResponse.json().catch(() => ({}));
+          if (!publishJson.ok) {
+            console.error(
+              `Best-effort Home re-publish after task_complete failed: ${publishJson.error}`
+            );
+          }
+        } catch (err) {
+          console.error("Error re-publishing Home view after task_complete:", err);
+        }
       }
-    } catch (err) {
-      console.error("Error POSTing message update to response_url:", err);
     }
+
+    return;
   }
-);
+
+  // --- Brief refresh: "🔄 Refresh brief" ----------------------------------
+  // Lives in the `voice_actions` row on briefs AND on the Home tab. Queue a
+  // "refresh" delegation entry (persisted like every other type, so it
+  // survives restarts and shows in GET /delegations/pending), then -
+  // message clicks only - POST to response_url rewriting JUST the
+  // voice_actions row: the refresh button's text becomes
+  // "🔄 Queued — runs on the next sweep" and its action_id is swapped to
+  // `brief_refresh_queued`, a no-op the unknown-action branch below
+  // ignores, so the same message can't queue twice. The 🎙️ link button is
+  // preserved untouched. Home-tab clicks have no response_url (and no
+  // message), so they just enqueue. /delegations/complete only targets
+  // `rec_text_<id>` section blocks, so it gracefully no-ops on the button
+  // row for refresh entries (the entry is still marked).
+  if (action.action_id === "brief_refresh") {
+    const channelId = (payload.channel && payload.channel.id) || null;
+    const messageTs = (payload.message && payload.message.ts) || null;
+
+    delegations.push({
+      id: `refresh-${Date.now()}`,
+      type: "refresh",
+      requested_at: new Date().toISOString(),
+      channel: channelId,
+      message_ts: messageTs,
+      status: "pending",
+    });
+    saveDelegations();
+
+    const responseUrl = payload.response_url;
+    const originalBlocks = payload.message && payload.message.blocks;
+    if (!responseUrl || !Array.isArray(originalBlocks) || originalBlocks.length === 0) {
+      return; // Home-tab click (or no message context): enqueue only.
+    }
+
+    const newBlocks = originalBlocks.map((block) => {
+      if (!block || block.block_id !== "voice_actions" || !Array.isArray(block.elements)) {
+        return block;
+      }
+      return {
+        ...block,
+        elements: block.elements.map((el) =>
+          el && el.action_id === "brief_refresh"
+            ? {
+                ...el,
+                action_id: "brief_refresh_queued",
+                text: {
+                  type: "plain_text",
+                  text: "🔄 Queued — runs on the next sweep",
+                  emoji: true,
+                },
+              }
+            : el
+        ),
+      };
+    });
+
+    await postResponseUrlUpdate(responseUrl, newBlocks, "brief_refresh");
+    return;
+  }
+
+  // --- "🙋 Delegate to..." person picker -----------------------------------
+  // A users_select on each recommendation row (action_id
+  // `item_delegate_person`). It carries no value: the item's text/link are
+  // recovered from the sibling buttons' values / the rec_text_<id> section
+  // (see recoverRecItem). Queue a persisted "delegated_to" entry, then
+  // rewrite the item's text in place to append
+  // "→ 🙋 delegated to <@USER>" - the buttons row is KEPT so the item can
+  // still be ✅-completed (or re-delegated) later.
+  if (action.action_id === "item_delegate_person") {
+    const selectedUser = action.selected_user;
+    if (!selectedUser) {
+      console.error("item_delegate_person interaction carried no selected_user - ignoring");
+      return;
+    }
+
+    const originalBlocks = payload.message && payload.message.blocks;
+    const item = recoverRecItem(originalBlocks, action.block_id);
+    if (!item) {
+      console.error(
+        `item_delegate_person click outside a ${REC_ACTIONS_BLOCK_ID_PREFIX}<id> block - ignoring`
+      );
+      return;
+    }
+
+    delegations.push({
+      id: `delegated-${Date.now()}`,
+      type: "delegated_to",
+      text: item.text,
+      link: item.link,
+      to_user_id: selectedUser,
+      clickedAt: new Date().toISOString(),
+      status: "pending",
+      channel: (payload.channel && payload.channel.id) || null,
+      message_ts: (payload.message && payload.message.ts) || null,
+    });
+    saveDelegations();
+
+    const responseUrl = payload.response_url;
+    if (!responseUrl || !Array.isArray(originalBlocks) || originalBlocks.length === 0) {
+      return;
+    }
+
+    const targetBlockId = `${REC_TEXT_BLOCK_ID_PREFIX}${item.itemId}`;
+    const newBlocks = originalBlocks.map((block) => {
+      if (
+        !block ||
+        block.block_id !== targetBlockId ||
+        !block.text ||
+        typeof block.text.text !== "string"
+      ) {
+        return block;
+      }
+      let newText = `${block.text.text}  → 🙋 delegated to <@${selectedUser}>`;
+      if (newText.length > MAX_SECTION_TEXT) {
+        newText = `${newText.slice(0, MAX_SECTION_TEXT - 1)}…`;
+      }
+      return { ...block, text: { ...block.text, text: newText } };
+    });
+
+    await postResponseUrlUpdate(responseUrl, newBlocks, "item_delegate_person");
+    return;
+  }
+
+  // --- "📌 Park for 1:1" ----------------------------------------------------
+  // Parks the item for the next 1:1: queue a persisted "park" entry (text/
+  // link recovered exactly like the person picker above), then rewrite the
+  // item's text to append "→ 📌 parked for next 1:1" and REMOVE its buttons
+  // row (parked counts as handled - no further actions on it).
+  if (action.action_id === "item_park") {
+    const originalBlocks = payload.message && payload.message.blocks;
+    const item = recoverRecItem(originalBlocks, action.block_id);
+    if (!item) {
+      console.error(
+        `item_park click outside a ${REC_ACTIONS_BLOCK_ID_PREFIX}<id> block - ignoring`
+      );
+      return;
+    }
+
+    delegations.push({
+      id: `park-${Date.now()}`,
+      type: "park",
+      text: item.text,
+      link: item.link,
+      clickedAt: new Date().toISOString(),
+      status: "pending",
+      channel: (payload.channel && payload.channel.id) || null,
+      message_ts: (payload.message && payload.message.ts) || null,
+    });
+    saveDelegations();
+
+    const responseUrl = payload.response_url;
+    if (!responseUrl || !Array.isArray(originalBlocks) || originalBlocks.length === 0) {
+      return;
+    }
+
+    const targetBlockId = `${REC_TEXT_BLOCK_ID_PREFIX}${item.itemId}`;
+    const newBlocks = originalBlocks
+      .filter((block) => !(block && block.block_id === action.block_id))
+      .map((block) => {
+        if (
+          !block ||
+          block.block_id !== targetBlockId ||
+          !block.text ||
+          typeof block.text.text !== "string"
+        ) {
+          return block;
+        }
+        let newText = `${block.text.text}  → 📌 parked for next 1:1`;
+        if (newText.length > MAX_SECTION_TEXT) {
+          newText = `${newText.slice(0, MAX_SECTION_TEXT - 1)}…`;
+        }
+        return { ...block, text: { ...block.text, text: newText } };
+      });
+
+    await postResponseUrlUpdate(responseUrl, newBlocks, "item_park");
+    return;
+  }
+
+  // --- Link buttons / unknown actions -------------------------------------
+  // Link buttons (e.g. the 🎙️ "Hear it" voice_open button) are handled
+  // entirely client-side by Slack - the URL opens in the browser - but
+  // Slack STILL sends a block_actions event for the click. It was already
+  // acked with an empty 200 (as is any other unrecognized action_id, e.g.
+  // the post-queue `brief_refresh_queued` no-op button), so there is
+  // nothing left to do and clicks never surface an error in Slack.
+  const KNOWN_BRIEF_ACTIONS = new Set(["item_up", "item_down", "item_done", "item_delegate"]);
+  if (!KNOWN_BRIEF_ACTIONS.has(action.action_id)) {
+    return;
+  }
+
+  let decoded;
+  try {
+    decoded = JSON.parse(action.value);
+  } catch (err) {
+    console.error(`${action.action_id} click carried an unparseable value - ignoring`);
+    return;
+  }
+
+  const { items, actedId } = decoded;
+  if (!Array.isArray(items) || !actedId) {
+    console.error(`${action.action_id} click value had no items/actedId - ignoring`);
+    return;
+  }
+
+  const originalBlocks = payload.message && payload.message.blocks;
+
+  // Re-attach links (not carried in button values) from the original blocks.
+  const linkById = extractRecLinks(originalBlocks);
+  items.forEach((item) => {
+    if (item && !item.link && linkById[item.id]) {
+      item.link = linkById[item.id];
+    }
+  });
+
+  // "🤖 Do it": push the clicked item onto the delegation queue (link
+  // recovered from the message's accessory URLs above), regardless of
+  // whether the message update below succeeds. `channel`/`message_ts`
+  // identify the original brief message so /delegations/complete can later
+  // strike the item out in place.
+  if (action.action_id === "item_delegate") {
+    const acted = items.find((item) => item && item.id === actedId);
+    delegations.push({
+      id: crypto.randomUUID(),
+      type: "calendar",
+      itemId: actedId,
+      text: acted && acted.text ? acted.text : "",
+      link: (acted && acted.link) || null,
+      channel: (payload.channel && payload.channel.id) || null,
+      message_ts: (payload.message && payload.message.ts) || null,
+      clickedAt: new Date().toISOString(),
+      status: "pending",
+    });
+    saveDelegations();
+  }
+
+  const responseUrl = payload.response_url;
+  if (!responseUrl) {
+    console.error("block_actions payload had no response_url; cannot update message");
+    return;
+  }
+
+  const newItems = applyAction(items, actedId, action.action_id);
+  const newRecsBlocks = buildRecommendationsBlocks(newItems);
+  const newBlocks = mergeUpdatedBlocks(originalBlocks, newRecsBlocks);
+
+  await postResponseUrlUpdate(responseUrl, newBlocks, action.action_id);
+}
 
 // ---------------------------------------------------------------------------
 // GET /delegations/pending
