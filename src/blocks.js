@@ -37,14 +37,19 @@
  *      a stable `rec_text_<id>` block_id. The actions half carries three
  *      buttons - 🔼 (item_up), 🔽 (item_down), ✅ (item_done) - plus a
  *      fourth "🤖 Do it" button (item_delegate) when the recommendation is
- *      marked `delegatable: true`, a "📌 Park for 1:1" button (item_park,
- *      static value), and a "🙋 Delegate to..." users_select
- *      (item_delegate_person, no value). Button `value` is a JSON string of
+ *      marked `delegatable: true`. Two further extras are CONDITIONAL and
+ *      default to off: a "📌 Park for 1:1" button (item_park, static value)
+ *      only when the rec is marked `parkable: true`, and a "🙋 Delegate
+ *      to..." users_select (item_delegate_person, no value) only when it is
+ *      marked `delegatable_person: true`. Payloads predating these flags
+ *      render neither, so old callers are unaffected.
+ *      Button `value` is a JSON string of
  *      `{ items: [...all current recommendations, in order...], actedId }`,
  *      so the whole ordered list travels with every click. No DB, no
  *      server-side state. To stay under Slack's 2000-char limit on button
  *      values, stored items carry only {id, text (truncated), done}, plus
- *      `d:1` when delegatable and `delegated:true` once delegated - links
+ *      `d:1` when delegatable, `p:1` when parkable, `dp:1` when
+ *      person-delegatable and `delegated:true` once delegated - links
  *      are NOT stored; the interactions handler recovers them from the
  *      original message's `rec_text_<id>` accessory URLs.
  *
@@ -444,6 +449,36 @@ function isDelegatable(rec) {
 }
 
 /**
+ * True when a recommendation may be parked for the next 1:1 ("📌 Park for
+ * 1:1"). Accepts both the caller-facing `parkable: true` shape and the
+ * compact `p: 1` flag that round-trips through button `value` payloads.
+ * Defaults to FALSE, so payloads predating the flag render no 📌 button.
+ *
+ * @param {{parkable?: boolean, p?: number}} rec
+ * @returns {boolean}
+ */
+function isParkable(rec) {
+  return !!(rec && (rec.parkable || rec.p));
+}
+
+/**
+ * True when a recommendation may be delegated to a PERSON (the "🙋 Delegate
+ * to..." users_select). Accepts both the caller-facing
+ * `delegatable_person: true` shape and the compact `dp: 1` flag that
+ * round-trips through button `value` payloads. Defaults to FALSE, so
+ * payloads predating the flag render no 🙋 picker.
+ *
+ * Note this is INDEPENDENT of `delegatable` (🤖 Do it, delegate to the bot):
+ * an item can be bot-delegatable, person-delegatable, both, or neither.
+ *
+ * @param {{delegatable_person?: boolean, dp?: number}} rec
+ * @returns {boolean}
+ */
+function isPersonDelegatable(rec) {
+  return !!(rec && (rec.delegatable_person || rec.dp));
+}
+
+/**
  * Stable per-recommendation block_id prefix for the section half of each
  * recommendation pair (and for done items). The interactions handler uses
  * these to recover each recommendation's link (its accessory URL) from the
@@ -468,6 +503,11 @@ const REC_TEXT_BLOCK_ID_PREFIX = "rec_text_";
 function toStoredItem(rec, textCap) {
   const stored = { id: rec.id, text: truncate(String(rec.text == null ? "" : rec.text), textCap), done: !!rec.done };
   if (isDelegatable(rec)) stored.d = 1;
+  // `p` / `dp` mirror `d`: without them the 📌/🙋 extras would silently
+  // disappear from every row the first time any 🔼/🔽/✅ click rebuilds the
+  // list from a button value. Omitted when false, to save value bytes.
+  if (isParkable(rec)) stored.p = 1;
+  if (isPersonDelegatable(rec)) stored.dp = 1;
   if (rec.delegated) stored.delegated = true;
   return stored;
 }
@@ -546,7 +586,9 @@ function buildDelegatedItemBlock(rec) {
  * @param {number} rank - 1-based rank among NOT-done items only
  * @param {boolean} compact - when true, 🔼/🔽 are skipped (list is large;
  *   stay under Slack block limits): non-delegatable items keep just ✅,
- *   delegatable items keep ✅ and 🤖 Do it
+ *   delegatable items keep ✅ and 🤖 Do it. The conditional 📌 / 🙋 extras
+ *   are independent of `compact` - they follow the rec's `parkable` /
+ *   `delegatable_person` flags either way.
  * @returns {Array<object>} [section block, actions block]
  */
 function buildRecommendationPairBlocks(allRecommendations, recommendation, rank, compact) {
@@ -576,12 +618,15 @@ function buildRecommendationPairBlocks(allRecommendations, recommendation, rank,
   // row. The value is a static marker (NOT the {items, actedId} payload) -
   // the handler recovers the item's text from the sibling buttons' values
   // and its link from the rec_text_<id> accessory URL.
-  elements.push({
-    type: "button",
-    action_id: "item_park",
-    text: { type: "plain_text", text: "📌 Park for 1:1", emoji: true },
-    value: '{"type":"park"}',
-  });
+  // Rendered ONLY for items flagged `parkable: true` (default false).
+  if (isParkable(recommendation)) {
+    elements.push({
+      type: "button",
+      action_id: "item_park",
+      text: { type: "plain_text", text: "📌 Park for 1:1", emoji: true },
+      value: '{"type":"park"}',
+    });
+  }
 
   // "🙋 Delegate to..." user picker (action_id `item_delegate_person`):
   // selecting a person queues a "delegated_to" delegation entry. It carries
@@ -590,11 +635,15 @@ function buildRecommendationPairBlocks(allRecommendations, recommendation, rank,
   // buttons' values / the rec_text_<id> accessory URL. Row element count
   // stays at most 6 (🔼🔽✅🤖📌 + this), well under Slack's 25-element cap
   // on actions blocks.
-  elements.push({
-    type: "users_select",
-    action_id: "item_delegate_person",
-    placeholder: { type: "plain_text", text: "🙋 Delegate to...", emoji: true },
-  });
+  // Rendered ONLY for items flagged `delegatable_person: true` (default
+  // false).
+  if (isPersonDelegatable(recommendation)) {
+    elements.push({
+      type: "users_select",
+      action_id: "item_delegate_person",
+      placeholder: { type: "plain_text", text: "🙋 Delegate to...", emoji: true },
+    });
+  }
 
   return [
     sectionBlock,
