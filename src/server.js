@@ -47,6 +47,12 @@ const SLACK_API_BASE = process.env.SLACK_API_BASE || "https://slack.com/api";
 //                     the original brief message for /delegations/complete)
 //   - "task_complete" (✅ Complete on a Home-tab triage row): + taskId, text,
 //                     source, link
+//   - "bot_do"        (🤖 Do it on a Home-tab triage row): shaped
+//                     { id: "botdo-<ms>", type, task_id, text, link, source,
+//                     clickedAt, status }
+//   - "gmail_zero_start" / "slack_zero_start" (🧹 Start sweep on a Home-tab
+//                     🎯 Projects row): shaped { id: "gmailzero-<ms>" /
+//                     "slackzero-<ms>", type, clickedAt, status }
 //   - "triage_add"    ("Add to Triage" message shortcut): + text, channel,
 //                     message_ts, permalink
 //   - "delegated_to"  (🙋 "Delegate to..." users_select on a brief
@@ -205,8 +211,8 @@ app.post("/render-brief", requireInternalSecret, express.json({ limit: RENDER_BO
 // Publishes the App Home "bandwidth meter" view for a user via Slack's
 // views.publish. Body: { user, date_label?, meeting_hours_today?,
 // focus_hours_today?, meetings_this_week?, meeting_hours_week?,
-// pending_items?, new_today?, on_call?, notes?, burndown?, tasks?,
-// delegated? } - all
+// pending_items?, new_today?, on_call?, notes?, burndown?, projects?,
+// tasks?, delegated? } - all
 // fields except `user` are optional and only present fields are rendered
 // (see src/home.js / README for the burndown + triage-task shapes). Protected by the same
 // X-Internal-Secret header as /render-brief. NOTE: the Slack app's
@@ -432,6 +438,38 @@ async function postResponseUrlUpdate(responseUrl, blocks, context) {
   }
 }
 
+/**
+ * Best-effort views.publish of a rewritten Home view (Home-tab clicks have
+ * no response_url). Failures are logged with `context` (the acting
+ * action_id), never thrown - the interaction was already acked and the next
+ * scheduled /update-home push is the authoritative refresh anyway.
+ *
+ * @param {string} userId
+ * @param {Array<object>} blocks
+ * @param {string} context
+ */
+async function republishHomeView(userId, blocks, context) {
+  try {
+    const publishResponse = await fetch(`${SLACK_API_BASE}/views.publish`, {
+      method: "POST",
+      headers: {
+        "Content-Type": "application/json; charset=utf-8",
+        Authorization: `Bearer ${SLACK_BOT_TOKEN}`,
+      },
+      body: JSON.stringify({
+        user_id: userId,
+        view: { type: "home", blocks },
+      }),
+    });
+    const publishJson = await publishResponse.json().catch(() => ({}));
+    if (!publishJson.ok) {
+      console.error(`Best-effort Home re-publish after ${context} failed: ${publishJson.error}`);
+    }
+  } catch (err) {
+    console.error(`Error re-publishing Home view after ${context}:`, err);
+  }
+}
+
 app.post(
   "/slack/interactions",
   express.urlencoded({ extended: false, limit: INTERACTIONS_BODY_LIMIT, verify: captureRawBody }),
@@ -550,8 +588,15 @@ async function processInteraction(payload) {
       userId &&
       task.taskId !== undefined
     ) {
+      // Each triage row is a section (`task_<id>`) + actions
+      // (`task_actions_<id>`) pair - drop both.
       const remaining = view.blocks.filter(
-        (block) => !(block && block.block_id === `task_${task.taskId}`)
+        (block) =>
+          !(
+            block &&
+            (block.block_id === `task_${task.taskId}` ||
+              block.block_id === `task_actions_${task.taskId}`)
+          )
       );
       if (remaining.length < view.blocks.length) {
         try {
@@ -575,6 +620,108 @@ async function processInteraction(payload) {
         } catch (err) {
           console.error("Error re-publishing Home view after task_complete:", err);
         }
+      }
+    }
+
+    return;
+  }
+
+  // --- Home-tab triage: "🤖 Do it" -----------------------------------------
+  // Queue a "bot_do" entry for the agent-side drain, then (best-effort)
+  // re-publish the Home view with the row's text marked "→ 🤖 queued" and
+  // its buttons row removed, so the same task can't be double-queued.
+  if (action.action_id === "home_task_bot") {
+    let task;
+    try {
+      task = JSON.parse(action.value);
+    } catch (err) {
+      console.error("home_task_bot click carried an unparseable value - ignoring");
+      return;
+    }
+
+    delegations.push({
+      id: `botdo-${Date.now()}`,
+      type: "bot_do",
+      task_id: task.id !== undefined ? task.id : null,
+      text: task.text || "",
+      link: task.link || null,
+      source: task.source || "manual",
+      clickedAt: new Date().toISOString(),
+      status: "pending",
+    });
+    saveDelegations();
+
+    const view = payload.view;
+    const userId = payload.user && payload.user.id;
+    if (
+      view &&
+      view.type === "home" &&
+      Array.isArray(view.blocks) &&
+      userId &&
+      task.id !== undefined &&
+      task.id !== null
+    ) {
+      let changed = false;
+      const newBlocks = view.blocks
+        .filter((block) => !(block && block.block_id === `task_actions_${task.id}`))
+        .map((block) => {
+          if (
+            !block ||
+            block.block_id !== `task_${task.id}` ||
+            !block.text ||
+            typeof block.text.text !== "string"
+          ) {
+            return block;
+          }
+          changed = true;
+          let newText = `${block.text.text} → 🤖 queued`;
+          if (newText.length > MAX_SECTION_TEXT) {
+            newText = `${newText.slice(0, MAX_SECTION_TEXT - 1)}…`;
+          }
+          return { ...block, text: { ...block.text, text: newText } };
+        });
+      if (changed || newBlocks.length < view.blocks.length) {
+        await republishHomeView(userId, newBlocks, "home_task_bot");
+      }
+    }
+
+    return;
+  }
+
+  // --- Home-tab 🎯 Projects: "🧹 Start sweep" -------------------------------
+  // Gmail → Zero / Slack → Zero mission kick-off. Queue the matching
+  // "gmail_zero_start" / "slack_zero_start" entry, then (best-effort)
+  // re-publish the Home view with the clicked row's button removed and
+  // "→ 🧹 sweep queued" appended, so the mission can't be double-queued.
+  if (action.action_id === "project_gmail_zero" || action.action_id === "project_slack_zero") {
+    const isGmail = action.action_id === "project_gmail_zero";
+    delegations.push({
+      id: `${isGmail ? "gmailzero" : "slackzero"}-${Date.now()}`,
+      type: isGmail ? "gmail_zero_start" : "slack_zero_start",
+      clickedAt: new Date().toISOString(),
+      status: "pending",
+    });
+    saveDelegations();
+
+    const view = payload.view;
+    const userId = payload.user && payload.user.id;
+    if (view && view.type === "home" && Array.isArray(view.blocks) && userId) {
+      let changed = false;
+      const newBlocks = view.blocks.map((block) => {
+        if (
+          !block ||
+          block.block_id !== action.block_id ||
+          !block.text ||
+          typeof block.text.text !== "string"
+        ) {
+          return block;
+        }
+        changed = true;
+        const { accessory, ...rest } = block; // drop the clicked button
+        return { ...rest, text: { ...rest.text, text: `${rest.text.text} → 🧹 sweep queued` } };
+      });
+      if (changed) {
+        await republishHomeView(userId, newBlocks, action.action_id);
       }
     }
 
@@ -891,8 +1038,9 @@ async function processInteraction(payload) {
 //
 // Returns every delegation-queue entry still awaiting an ack:
 // { items: [{ id, type, ..., clickedAt, status: "pending" }] } where `type`
-// is "calendar" | "task_complete" | "triage_add" | "archive_email" |
-// "urgent_done" | "refresh" (see the queue comment at
+// is "calendar" | "task_complete" | "bot_do" | "triage_add" |
+// "archive_email" | "urgent_done" | "refresh" | "gmail_zero_start" |
+// "slack_zero_start" (see the queue comment at
 // the top of this file for per-type fields). Entries queued before the
 // `type` field existed are reported as "calendar" so consumers can always
 // distinguish. Protected by the same X-Internal-Secret header as

@@ -21,13 +21,21 @@
  *      🟢 Light day (<34%), 🟡 Balanced (34-67%), 🔴 Meeting-heavy (>67%)
  *   3. a fields section: meetings today, open focus time, meetings this
  *      week, pending items, new today, on call
- *   4. (when `burndown.baseline` > 0) a burn-down bar: 10-segment █/░ bar of
- *      the cleared fraction, "X of Y cleared", and a "💬 N Slack | 📧 N Email"
- *      breakdown — or a "🎉 Inbox Zero!" header when current === 0
- *   5. (when `tasks` is a non-empty array) a "📥 Triage" board: one section
- *      row per task (source icon + text + inline "open" link) with a
- *      "✅ Complete" accessory button (action_id "task_complete"), capped at
- *      MAX_TRIAGE_TASKS rows plus an "…and N more" context line
+ *   4. (when `projects` is present) a "🎯 Projects" Zero-missions board: one
+ *      row per mission (Gmail → Zero / Slack → Zero) with the live count and
+ *      a "🧹 Start sweep" accessory button (action_ids "project_gmail_zero" /
+ *      "project_slack_zero"); a 0 count renders "✨ at zero" with no button.
+ *      `projects` REPLACES the burn-down bar — otherwise (back-compat, when
+ *      only `burndown.baseline` > 0 is present) the old burn-down bar renders
+ *      unchanged: 10-segment █/░ bar of the cleared fraction, "X of Y
+ *      cleared", and a "💬 N Slack | 📧 N Email" breakdown — or a
+ *      "🎉 Inbox Zero!" header when current === 0
+ *   5. (when `tasks` is a non-empty array) a "📥 Triage" board: one
+ *      section+actions pair per task — the section is source icon + text
+ *      (hyperlinked to task.link when present), the actions row holds a
+ *      "✅ Complete" button (action_id "task_complete") and a "🤖 Do it"
+ *      button (action_id "home_task_bot") — capped at MAX_TRIAGE_TASKS rows
+ *      plus an "…and N more" context line
  *   5b. (when `delegated` is a non-empty array) a "🙋 Delegated" section:
  *      one line per item - "🟢/🟡/🔴 <text> → <to> (<days>d)" with an inline
  *      "open" link when present - capped at MAX_DELEGATED_ITEMS items.
@@ -41,8 +49,9 @@ const { buildVoiceButtonBlock } = require("./blocks");
 const METER_SEGMENTS = 10;
 const BURNDOWN_SEGMENTS = 10;
 
-// Slack caps a Home view at 100 blocks; each triage task costs 1 block, so
-// capping at 20 leaves ample room for the meter/fields/notes sections.
+// Slack caps a Home view at 100 blocks; each triage task costs 2 blocks
+// (section + actions row), so capping at 20 (40 blocks) still leaves ample
+// room for the meter/fields/projects/notes sections.
 const MAX_TRIAGE_TASKS = 20;
 
 // Slack caps a button's `value` at 2000 characters.
@@ -135,6 +144,41 @@ function buildTaskValue(task) {
   return json;
 }
 
+// "🤖 Do it" button values carry a short task summary; 140 chars is plenty
+// for the queue drain to identify the task.
+const BOT_VALUE_TEXT_MAX = 140;
+
+/**
+ * Serializes a triage task into a "home_task_bot" button `value`:
+ * {id, text (≤140 chars), link?, source?}. Stays within Slack's 2000-char
+ * cap by dropping the link FIRST (a queue drain can re-derive it from the
+ * task id), then shrinking the text as a last resort.
+ *
+ * @param {{id: string, text?: string, source?: string, link?: string}} task
+ * @returns {string} JSON string {id, text, link?, source?}
+ */
+function buildBotValue(task) {
+  let text = typeof task.text === "string" ? task.text : "";
+  if (text.length > BOT_VALUE_TEXT_MAX) {
+    text = `${text.slice(0, BOT_VALUE_TEXT_MAX - 1)}…`;
+  }
+  const value = { id: task.id !== undefined && task.id !== null ? task.id : null, text };
+  if (typeof task.link === "string" && task.link) value.link = task.link;
+  if (typeof task.source === "string" && task.source) value.source = task.source;
+
+  let json = JSON.stringify(value);
+  if (json.length > BUTTON_VALUE_MAX && value.link) {
+    delete value.link;
+    json = JSON.stringify(value);
+  }
+  while (json.length > BUTTON_VALUE_MAX && value.text.length > 1) {
+    value.text = `${value.text.slice(0, Math.max(0, value.text.length - (json.length - BUTTON_VALUE_MAX) - 1))}…`;
+    json = JSON.stringify(value);
+    if (value.text === "…") break;
+  }
+  return json;
+}
+
 /**
  * Builds the burn-down section blocks (divider + bar/celebration +
  * breakdown). Returns [] when baseline is absent, non-numeric, or <= 0.
@@ -183,10 +227,82 @@ function buildBurndownBlocks(burndown) {
   return blocks;
 }
 
+// The two Zero missions, keyed by payload field under `projects`.
+const PROJECT_MISSIONS = [
+  {
+    key: "gmail",
+    label: "📧 *Gmail → Zero*",
+    unit: "in inbox",
+    actionId: "project_gmail_zero",
+    value: '{"type":"gmail_zero_start"}',
+  },
+  {
+    key: "slack",
+    label: "💬 *Slack → Zero*",
+    unit: "awaiting reply",
+    actionId: "project_slack_zero",
+    value: '{"type":"slack_zero_start"}',
+  },
+];
+
 /**
- * Builds the "📥 Triage" board blocks: one section row per task with a
- * "✅ Complete" accessory button, capped at MAX_TRIAGE_TASKS with an
- * "…and N more" context line. Returns [] when there are no valid tasks.
+ * Builds the "🎯 Projects" Zero-missions blocks (divider + header + one
+ * section row per mission with a count). Rows with a count > 0 get a
+ * "🧹 Start sweep" accessory button; a 0 count renders "✨ at zero" with no
+ * button. Missions whose count is absent/non-numeric are skipped; returns []
+ * when no mission has a usable count.
+ *
+ * @param {{gmail?: {count?: number}, slack?: {count?: number}}|undefined} projects
+ * @returns {Array<object>}
+ */
+function buildProjectsBlocks(projects) {
+  if (!projects || typeof projects !== "object") return [];
+
+  const rows = [];
+  PROJECT_MISSIONS.forEach((mission) => {
+    const entry = projects[mission.key];
+    if (!entry || !isNum(entry.count)) return;
+
+    const block = {
+      type: "section",
+      block_id: `project_${mission.key}`,
+      text: {
+        type: "mrkdwn",
+        text:
+          entry.count === 0
+            ? `${mission.label} — ✨ at zero`
+            : `${mission.label} — ${entry.count} ${mission.unit}`,
+      },
+    };
+    if (entry.count > 0) {
+      block.accessory = {
+        type: "button",
+        text: { type: "plain_text", text: "🧹 Start sweep", emoji: true },
+        action_id: mission.actionId,
+        value: mission.value,
+      };
+    }
+    rows.push(block);
+  });
+
+  if (rows.length === 0) return [];
+
+  return [
+    { type: "divider" },
+    {
+      type: "header",
+      text: { type: "plain_text", text: "🎯 Projects", emoji: true },
+    },
+    ...rows,
+  ];
+}
+
+/**
+ * Builds the "📥 Triage" board blocks: one section+actions pair per task —
+ * the section is the task text (hyperlinked to task.link when present), the
+ * actions row holds "✅ Complete" and "🤖 Do it" buttons — capped at
+ * MAX_TRIAGE_TASKS with an "…and N more" context line. Returns [] when
+ * there are no valid tasks.
  *
  * @param {Array<{id: string, text: string, source?: string, link?: string,
  *                status?: string}>|undefined} tasks
@@ -209,22 +325,36 @@ function buildTriageBlocks(tasks) {
   valid.slice(0, MAX_TRIAGE_TASKS).forEach((task, index) => {
     const icon = TASK_SOURCE_ICONS[task.source] || TASK_SOURCE_ICONS.manual;
     const doing = task.status === "doing" ? " 🔄" : "";
-    let text = `${icon}${doing} ${task.text}`;
-    if (typeof task.link === "string" && task.link) {
-      text += ` · <${task.link}|open>`;
-    }
+    const hasLink = typeof task.link === "string" && task.link;
+    const text = `${icon}${doing} ${hasLink ? `<${task.link}|${task.text}>` : task.text}`;
+    const taskId = task.id !== undefined && task.id !== null ? task.id : index;
+    // Stable block_ids (`task_<id>` / `task_actions_<id>`) let
+    // /slack/interactions surgically rewrite or remove this pair from
+    // payload.view.blocks for instant feedback on ✅ Complete / 🤖 Do it.
+    // A section accessory holds one button max, so the two buttons live in
+    // a trailing actions block (same pattern as the brief's rec rows).
     blocks.push({
-      // Stable block_id lets /slack/interactions surgically remove this row
-      // from payload.view.blocks for instant feedback on ✅ Complete.
       type: "section",
-      block_id: `task_${task.id !== undefined && task.id !== null ? task.id : index}`,
+      block_id: `task_${taskId}`,
       text: { type: "mrkdwn", text },
-      accessory: {
-        type: "button",
-        text: { type: "plain_text", text: "✅ Complete", emoji: true },
-        action_id: "task_complete",
-        value: buildTaskValue(task),
-      },
+    });
+    blocks.push({
+      type: "actions",
+      block_id: `task_actions_${taskId}`,
+      elements: [
+        {
+          type: "button",
+          text: { type: "plain_text", text: "✅ Complete", emoji: true },
+          action_id: "task_complete",
+          value: buildTaskValue(task),
+        },
+        {
+          type: "button",
+          text: { type: "plain_text", text: "🤖 Do it", emoji: true },
+          action_id: "home_task_bot",
+          value: buildBotValue(task),
+        },
+      ],
     });
   });
 
@@ -322,6 +452,7 @@ function buildHomeView(payload) {
     on_call,
     notes,
     burndown,
+    projects,
     tasks,
     delegated,
   } = payload || {};
@@ -391,8 +522,14 @@ function buildHomeView(payload) {
     });
   }
 
-  // --- Burn-down bar (above triage) ----------------------------------------
-  blocks.push(...buildBurndownBlocks(burndown));
+  // --- Zero missions / burn-down bar (above triage) -------------------------
+  // `projects` replaces the burn-down meter; when both are present, projects
+  // wins. Payloads without `projects` render the old burn-down unchanged.
+  if (projects && typeof projects === "object") {
+    blocks.push(...buildProjectsBlocks(projects));
+  } else {
+    blocks.push(...buildBurndownBlocks(burndown));
+  }
 
   // --- Triage board ----------------------------------------------------------
   blocks.push(...buildTriageBlocks(tasks));
@@ -432,9 +569,11 @@ module.exports = {
   buildHomeView,
   computeMeter,
   buildBurndownBlocks,
+  buildProjectsBlocks,
   buildTriageBlocks,
   buildDelegatedBlocks,
   buildTaskValue,
+  buildBotValue,
   MAX_TRIAGE_TASKS,
   MAX_DELEGATED_ITEMS,
 };

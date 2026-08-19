@@ -152,6 +152,7 @@ close-out.
   | `on_call` | boolean | Renders `🔴 yes` / `—`. |
   | `notes` | string[] | Short lines, one context row each. |
   | `burndown` | object | Optional inbox burn-down bar — see below. |
+  | `projects` | object | Optional Zero-missions board (replaces the burn-down bar) — see below. |
   | `tasks` | object[] | Optional triage-board tasks — see below. |
 
   **All numeric fields are optional** — only fields actually present are
@@ -172,6 +173,27 @@ cleared fraction `(baseline - current) / baseline` (clamped to 0–1), an
   header replaces the bar.
 - `baseline` absent, non-numeric, or `0` → the whole section is skipped.
 
+#### `projects` (optional)
+
+```json
+{ "gmail": { "count": 201 }, "slack": { "count": 10 } }
+```
+
+When present, a **"🎯 Projects"** Zero-missions board renders **instead of**
+the burn-down bar (when both fields are present, `projects` wins; payloads
+with only `burndown` render the old bar unchanged). One row per mission:
+
+- `📧 *Gmail → Zero* — N in inbox` with a **🧹 Start sweep** button
+  (`action_id: "project_gmail_zero"`, value `{"type":"gmail_zero_start"}`);
+- `💬 *Slack → Zero* — N awaiting reply` with a **🧹 Start sweep** button
+  (`action_id: "project_slack_zero"`, value `{"type":"slack_zero_start"}`).
+
+A `count` of `0` renders `✨ at zero` with no button; a mission whose
+`count` is absent/non-numeric is skipped. Clicking **🧹 Start sweep**
+queues a `gmail_zero_start` / `slack_zero_start` delegation entry and
+best-effort re-publishes the Home view with the row marked
+"→ 🧹 sweep queued" (button removed).
+
 #### `tasks` (optional)
 
 ```json
@@ -186,21 +208,26 @@ cleared fraction `(baseline - current) / baseline` (clamped to 0–1), an
 | `id` | string, required | Stable task id (echoed back on completion). |
 | `text` | string, required | Task text. |
 | `source` | `"slack"` \| `"email"` \| `"manual"` | Rendered as 💬 / 📧 / 📝 (default 📝). |
-| `link` | string | Rendered as an inline `open` link. |
+| `link` | string | The task text is hyperlinked to it. |
 | `status` | `"todo"` \| `"doing"` | `"doing"` adds a 🔄 marker. |
 
 When present and non-empty, a **"📥 Triage"** section is rendered below the
-bandwidth meter (and below the burn-down bar): one row per task with a
-**✅ Complete** button (`action_id: "task_complete"`, whose `value` carries
-`{taskId, text, source, link}` — the text is truncated as needed to stay
-under Slack's 2000-char button-value cap). At most **20 tasks** are rendered
-(one block each, keeping the Home view safely under Slack's 100-block
-limit); extras collapse into an "…and N more" context line.
+bandwidth meter (and below the burn-down bar / projects board): one
+section+actions pair per task — the task text (hyperlinked to `link` when
+present) plus a buttons row with **✅ Complete** (`action_id:
+"task_complete"`, whose `value` carries `{taskId, text, source, link}`) and
+**🤖 Do it** (`action_id: "home_task_bot"`, whose `value` carries
+`{id, text (≤140 chars), link?, source?}`) — both values stay under Slack's
+2000-char button-value cap. At most **20 tasks** are rendered (two blocks
+each, keeping the Home view safely under Slack's 100-block limit); extras
+collapse into an "…and N more" context line.
 
 Clicking **✅ Complete** pushes a `task_complete` entry onto the delegation
 queue (see `/delegations/pending`) and best-effort re-publishes the Home
-view without that row for instant feedback; the next scheduled
-`/update-home` push is the authoritative refresh.
+view without that row for instant feedback; clicking **🤖 Do it** pushes a
+`bot_do` entry and re-publishes with the row marked "→ 🤖 queued" (buttons
+removed). The next scheduled `/update-home` push is the authoritative
+refresh either way.
 - The view shows a 10-segment `█`/`░` meter of today's meeting load,
   `meeting_hours_today / (meeting_hours_today + focus_hours_today)`, with a
   plain-English read: 🟢 Light day (<34%), 🟡 Balanced (34–67%),
@@ -272,6 +299,8 @@ entry has a `type` field telling the consumer which click produced it:
 | --- | --- | --- |
 | `"calendar"` | 🤖 Do it on a brief recommendation | `itemId`, `text`, `link`, `channel`, `message_ts` |
 | `"task_complete"` | ✅ Complete on a Home-tab triage row | `taskId`, `text`, `source`, `link` |
+| `"bot_do"` | 🤖 Do it on a Home-tab triage row | `task_id`, `text`, `link`, `source` |
+| `"gmail_zero_start"` / `"slack_zero_start"` | 🧹 Start sweep on a Home-tab 🎯 Projects row | — |
 | `"triage_add"` | "Add to Triage" message shortcut | `text`, `channel`, `message_ts`, `permalink` |
 
 For `"calendar"` entries, `channel`/`message_ts` identify the original brief
