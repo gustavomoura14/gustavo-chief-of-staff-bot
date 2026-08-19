@@ -56,6 +56,12 @@ const SLACK_API_BASE = process.env.SLACK_API_BASE || "https://slack.com/api";
 //   - "park"          (📌 "Park for 1:1" on a brief recommendation): shaped
 //                     { id: "park-<ms>", type, text, link, clickedAt,
 //                     status, channel, message_ts }
+//   - "archive_email" (🗑️ Archive on an actionable section item): shaped
+//                     { id: <item id or "archive-<ms>">, type,
+//                     gmail_thread_id, text, link, clickedAt, status,
+//                     channel, message_ts }
+//   - "urgent_done"   (✅ Done on an actionable section item): shaped like
+//                     "archive_email" minus gmail_thread_id
 //   - "refresh"       (🔄 Refresh brief button, on briefs and the Home tab):
 //                     shaped { id: "refresh-<ms>", type, requested_at,
 //                     channel, message_ts, status } - `id` is
@@ -139,9 +145,12 @@ app.get("/healthz", (req, res) => {
 // a brand new Morning Brief message into a Slack channel/thread.
 // Protected by a shared secret header, X-Internal-Secret. Body parsing is
 // scoped to this route so it never interferes with /slack/interactions'
-// form-encoded parsing below.
+// form-encoded parsing below; the limit is raised past express.json's 100kb
+// default because briefs keep growing.
 // ---------------------------------------------------------------------------
-app.post("/render-brief", requireInternalSecret, express.json(), async (req, res) => {
+const RENDER_BODY_LIMIT = "1mb";
+
+app.post("/render-brief", requireInternalSecret, express.json({ limit: RENDER_BODY_LIMIT }), async (req, res) => {
   const { channel, thread_ts, priority_recap, sections, recommendations, title, emoji } =
     req.body || {};
 
@@ -205,7 +214,7 @@ app.post("/render-brief", requireInternalSecret, express.json(), async (req, res
 // returns an error like "not_enabled_for_app_home") - we relay Slack's
 // response verbatim rather than faking success.
 // ---------------------------------------------------------------------------
-app.post("/update-home", requireInternalSecret, express.json(), async (req, res) => {
+app.post("/update-home", requireInternalSecret, express.json({ limit: RENDER_BODY_LIMIT }), async (req, res) => {
   const body = req.body || {};
 
   if (!body.user || typeof body.user !== "string") {
@@ -749,6 +758,64 @@ async function processInteraction(payload) {
     return;
   }
 
+  // --- Actionable section items: 🗑️ Archive / ✅ Done ----------------------
+  // Section items rendered with an accessory button (see blocks.js). The
+  // button value carries {id, type, gmail_thread_id?, text, link?}. Queue
+  // the matching delegation entry ("archive_email" / "urgent_done"), then
+  // rewrite JUST the clicked block via response_url: strikethrough text plus
+  // a queued/done suffix, accessory button removed. Every other block is
+  // passed through untouched.
+  if (action.action_id === "sec_item_archive" || action.action_id === "sec_item_done") {
+    let value;
+    try {
+      value = JSON.parse(action.value);
+    } catch (err) {
+      console.error(`${action.action_id} click carried an unparseable value - ignoring`);
+      return;
+    }
+
+    const isArchive = action.action_id === "sec_item_archive";
+    delegations.push({
+      id: value.id || `${isArchive ? "archive" : "done"}-${Date.now()}`,
+      type: isArchive ? "archive_email" : "urgent_done",
+      ...(isArchive ? { gmail_thread_id: value.gmail_thread_id || null } : {}),
+      text: value.text || "",
+      link: value.link || null,
+      clickedAt: new Date().toISOString(),
+      status: "pending",
+      channel: (payload.channel && payload.channel.id) || null,
+      message_ts: (payload.message && payload.message.ts) || null,
+    });
+    saveDelegations();
+
+    const responseUrl = payload.response_url;
+    const originalBlocks = payload.message && payload.message.blocks;
+    if (!responseUrl || !Array.isArray(originalBlocks) || originalBlocks.length === 0) {
+      return;
+    }
+
+    const suffix = isArchive ? " → 🗑️ queued (runs on the next sweep)" : " → ✅ done";
+    const newBlocks = originalBlocks.map((block) => {
+      if (
+        !block ||
+        block.block_id !== action.block_id ||
+        !block.text ||
+        typeof block.text.text !== "string"
+      ) {
+        return block;
+      }
+      const { accessory, ...rest } = block; // drop the clicked button
+      let newText = `~${block.text.text}~${suffix}`;
+      if (newText.length > MAX_SECTION_TEXT) {
+        newText = `${newText.slice(0, MAX_SECTION_TEXT - 1)}…`;
+      }
+      return { ...rest, text: { ...rest.text, text: newText } };
+    });
+
+    await postResponseUrlUpdate(responseUrl, newBlocks, action.action_id);
+    return;
+  }
+
   // --- Link buttons / unknown actions -------------------------------------
   // Link buttons (e.g. the 🎙️ "Hear it" voice_open button) are handled
   // entirely client-side by Slack - the URL opens in the browser - but
@@ -824,7 +891,8 @@ async function processInteraction(payload) {
 //
 // Returns every delegation-queue entry still awaiting an ack:
 // { items: [{ id, type, ..., clickedAt, status: "pending" }] } where `type`
-// is "calendar" | "task_complete" | "triage_add" | "refresh" (see the queue comment at
+// is "calendar" | "task_complete" | "triage_add" | "archive_email" |
+// "urgent_done" | "refresh" (see the queue comment at
 // the top of this file for per-type fields). Entries queued before the
 // `type` field existed are reported as "calendar" so consumers can always
 // distinguish. Protected by the same X-Internal-Secret header as

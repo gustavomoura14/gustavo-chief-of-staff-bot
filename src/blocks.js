@@ -14,13 +14,23 @@
  *       project (VOICE_PROJECT_URL env var, with a built-in default) and a
  *       "🔄 Refresh brief" action button (action_id `brief_refresh`) that
  *       queues a "refresh" delegation entry
- *   3. for each entry in `sections`: ONE section block containing the bold
- *      title on the first line, then one "• item" line per item (flag as an
- *      italic suffix, link as an inline `<url|open>` mrkdwn link). Items may
- *      be plain strings or {text, link?, flag?} objects. A divider is
- *      inserted between each named section. Condensing each section to a
- *      single block keeps the whole message well under Slack's hard cap of
- *      50 blocks per message.
+ *   3. for each entry in `sections`: consecutive PLAIN items (strings or
+ *      {text, link?, flag?} objects) are condensed into ONE section block -
+ *      the bold title on the first line, then one "• item" line per item
+ *      (flag as an italic suffix, link as an inline `<url|open>` mrkdwn
+ *      link) - keeping the whole message well under Slack's hard cap of 50
+ *      blocks per message. Two further item shapes exist:
+ *        - ACTIONABLE items ({text, link?, id, action: {type, ...}}) render
+ *          as their own section block (text hyperlinked to `link` when
+ *          present) with an accessory button: action.type "archive_email" →
+ *          "🗑️ Archive" (action_id `sec_item_archive`), "done" → "✅ Done"
+ *          (action_id `sec_item_done`). The button value is a compact JSON
+ *          {id, type, gmail_thread_id?, text (truncated), link?}.
+ *        - CALENDAR items ({time, title, link?, note?}, no action) render as
+ *          compact "`8:00–9:00`  *<link|Title>* — note" lines, one section
+ *          block per run of consecutive calendar items (no per-item blocks
+ *          or dividers).
+ *      A divider is inserted between each named section.
  *   4. (optional) recommendations: a bold "Reply-worthy" header, then one
  *      section+actions block pair per recommendation. The section half is
  *      built like a plain item (text + optional link accessory) and carries
@@ -222,42 +232,182 @@ function buildPriorityRecapBlock(text) {
 // Named sections (e.g. "Urgent", "Calendar conflicts")
 // ---------------------------------------------------------------------------
 
+/** Accessory button config per actionable-item action.type (see below). */
+const SEC_ITEM_BUTTONS = {
+  archive_email: { action_id: "sec_item_archive", label: "🗑️ Archive" },
+  done: { action_id: "sec_item_done", label: "✅ Done" },
+};
+
+// Item text is truncated to this length inside sec_item_* button values, so
+// even with a long link the JSON stays well under Slack's 2000-char cap.
+const SEC_ITEM_VALUE_TEXT_MAX = 140;
+const SEC_ITEM_VALUE_SOFT_MAX = 1800;
+
+/** Stable block_id prefix for actionable section-item blocks. */
+const SEC_ITEM_BLOCK_ID_PREFIX = "sec_item_";
+
 /**
- * Renders one named section as a SINGLE section block: the bold title on the
- * first line, then one "• item" line per item (flag as an italic suffix,
- * link as an inline <url|open> mrkdwn link). Condensing to one block per
- * section (instead of one block per item) keeps the full message under
- * Slack's 50-block cap.
+ * True when a section item is an ACTIONABLE object - it carries an `action`
+ * with a type we render a button for.
+ *
+ * @param {any} item
+ * @returns {boolean}
+ */
+function isActionItem(item) {
+  return !!(
+    item &&
+    typeof item === "object" &&
+    item.action &&
+    SEC_ITEM_BUTTONS[item.action.type]
+  );
+}
+
+/**
+ * True when a section item is a compact CALENDAR object ({time, title}, and
+ * no `action` - actionable items win when both shapes are present).
+ *
+ * @param {any} item
+ * @returns {boolean}
+ */
+function isCalendarItem(item) {
+  return !!(
+    item &&
+    typeof item === "object" &&
+    !item.action &&
+    typeof item.time === "string" &&
+    typeof item.title === "string"
+  );
+}
+
+/**
+ * Renders one calendar item as a compact mrkdwn line:
+ * "`8:00–9:00`  *<link|Title>* — note" (note optional; title plain-bold when
+ * there is no link).
+ *
+ * @param {{time: string, title: string, link?: string, note?: string}} item
+ * @returns {string}
+ */
+function calendarItemMrkdwn(item) {
+  const title = String(item.title == null ? "" : item.title);
+  const titlePart = typeof item.link === "string" ? `*<${item.link}|${title}>*` : `*${title}*`;
+  let line = `\`${item.time}\`  ${titlePart}`;
+  if (item.note) {
+    line += ` — ${item.note}`;
+  }
+  return line;
+}
+
+/**
+ * Builds the section block for one ACTIONABLE item: mrkdwn text (hyperlinked
+ * to `item.link` when present) with an accessory 🗑️ Archive / ✅ Done button.
+ * The button value is a compact JSON {id, type, gmail_thread_id?, text
+ * (truncated), link?}; the link is dropped from the value (never truncated -
+ * a cut URL is useless) if it would push the JSON near Slack's 2000-char cap.
+ *
+ * @param {{text: string, link?: string, id?: string, action: {type: string, gmail_thread_id?: string}}} item
+ * @returns {object} Slack Block Kit `section` block
+ */
+function buildActionItemBlock(item) {
+  const config = SEC_ITEM_BUTTONS[item.action.type];
+  const text = String(item.text == null ? "" : item.text);
+
+  const value = { id: item.id, type: item.action.type };
+  if (typeof item.action.gmail_thread_id === "string") {
+    value.gmail_thread_id = item.action.gmail_thread_id;
+  }
+  value.text = truncate(text, SEC_ITEM_VALUE_TEXT_MAX);
+  if (typeof item.link === "string") value.link = item.link;
+  let valueJson = JSON.stringify(value);
+  if (valueJson.length > SEC_ITEM_VALUE_SOFT_MAX) {
+    delete value.link;
+    valueJson = JSON.stringify(value);
+  }
+
+  const mrkdwn = typeof item.link === "string" ? `<${item.link}|${text}>` : text;
+
+  return {
+    type: "section",
+    block_id: `${SEC_ITEM_BLOCK_ID_PREFIX}${item.id}`,
+    text: { type: "mrkdwn", text: truncate(mrkdwn, MAX_SECTION_TEXT) },
+    accessory: {
+      type: "button",
+      action_id: config.action_id,
+      text: { type: "plain_text", text: config.label, emoji: true },
+      value: valueJson,
+    },
+  };
+}
+
+/**
+ * Renders one named section. Consecutive PLAIN items are condensed into one
+ * section block (the bold title leads the first such block, exactly as
+ * before - an all-plain section still renders as the single classic block).
+ * Runs of consecutive CALENDAR items get one compact-lines block per run,
+ * and each ACTIONABLE item gets its own section block with an accessory
+ * button (see buildActionItemBlock).
  *
  * @param {{title: string, items: Array<string|object>}} section
  * @param {number} [maxItems] - when set and the section has more items,
  *   only the first `maxItems` are rendered, followed by an
  *   "…and N more" line
- * @returns {Array<object>} a single-element array (kept as an array for
- *   call-site compatibility)
+ * @returns {Array<object>}
  */
 function buildSectionBlocks(section, maxItems) {
-  const items = (section.items || []).map(normalizeItem);
+  const items = section.items || [];
   const shown = maxItems && items.length > maxItems ? items.slice(0, maxItems) : items;
 
-  const lines = [`*${section.title}*`];
-  shown.forEach((item) => {
-    let line = `• ${itemMrkdwn(item)}`;
-    if (item.link) {
-      line += `  <${item.link}|open>`;
-    }
-    lines.push(line);
-  });
-  if (shown.length < items.length) {
-    lines.push(`_…and ${items.length - shown.length} more_`);
-  }
+  const blocks = [];
+  let plainLines = [`*${section.title}*`]; // title leads the first plain block
+  let calendarLines = null; // open run of consecutive calendar items
 
-  return [
-    {
+  const pushLinesBlock = (lines) => {
+    blocks.push({
       type: "section",
       text: { type: "mrkdwn", text: truncate(lines.join("\n"), MAX_SECTION_TEXT) },
-    },
-  ];
+    });
+  };
+  const flushPlain = () => {
+    if (plainLines.length > 0) {
+      pushLinesBlock(plainLines);
+      plainLines = [];
+    }
+  };
+  const flushCalendar = () => {
+    if (calendarLines) {
+      pushLinesBlock(calendarLines);
+      calendarLines = null;
+    }
+  };
+
+  shown.forEach((raw) => {
+    if (isActionItem(raw)) {
+      flushPlain();
+      flushCalendar();
+      blocks.push(buildActionItemBlock(raw));
+    } else if (isCalendarItem(raw)) {
+      flushPlain();
+      if (!calendarLines) calendarLines = [];
+      calendarLines.push(calendarItemMrkdwn(raw));
+    } else {
+      flushCalendar();
+      const item = normalizeItem(raw);
+      let line = `• ${itemMrkdwn(item)}`;
+      if (item.link) {
+        line += `  <${item.link}|open>`;
+      }
+      plainLines.push(line);
+    }
+  });
+
+  if (shown.length < items.length) {
+    const more = `_…and ${items.length - shown.length} more_`;
+    if (calendarLines) calendarLines.push(more);
+    else plainLines.push(more);
+  }
+  flushPlain();
+  flushCalendar();
+
+  return blocks;
 }
 
 // ---------------------------------------------------------------------------
