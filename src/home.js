@@ -33,8 +33,10 @@
  *   5. (when `tasks` is a non-empty array) a "📥 Triage" board: one
  *      section+actions pair per task — the section is source icon + text
  *      (hyperlinked to task.link when present), the actions row holds a
- *      "✅ Complete" button (action_id "task_complete") and a "🤖 Do it"
- *      button (action_id "home_task_bot") — capped at MAX_TRIAGE_TASKS rows
+ *      "✅ Complete" button (action_id "task_complete"), a "🤖 Do it"
+ *      button (action_id "home_task_bot"), a "📌 Park for 1:1" button
+ *      (action_id "home_task_park") and a "🙋 Delegate to..." users_select
+ *      (action_id "home_task_delegate") — capped at MAX_TRIAGE_TASKS rows
  *      plus an "…and N more" context line
  *   5b. (when `delegated` is a non-empty array) a "🙋 Delegated" section:
  *      one line per item - "🟢/🟡/🔴 <text> → <to> (<days>d)" with an inline
@@ -144,27 +146,28 @@ function buildTaskValue(task) {
   return json;
 }
 
-// "🤖 Do it" button values carry a short task summary; 140 chars is plenty
-// for the queue drain to identify the task.
+// "🤖 Do it" / "📌 Park" button values carry a short task summary; 140 chars
+// is plenty for the queue drain to identify the task.
 const BOT_VALUE_TEXT_MAX = 140;
 
 /**
- * Serializes a triage task into a "home_task_bot" button `value`:
- * {id, text (≤140 chars), link?, source?}. Stays within Slack's 2000-char
+ * Serializes a triage task into a compact button `value`:
+ * {id, text (≤140 chars), link?[, source?]}. Stays within Slack's 2000-char
  * cap by dropping the link FIRST (a queue drain can re-derive it from the
  * task id), then shrinking the text as a last resort.
  *
  * @param {{id: string, text?: string, source?: string, link?: string}} task
+ * @param {boolean} withSource - also carry task.source (the 🤖 Do it shape)
  * @returns {string} JSON string {id, text, link?, source?}
  */
-function buildBotValue(task) {
+function buildCompactValue(task, withSource) {
   let text = typeof task.text === "string" ? task.text : "";
   if (text.length > BOT_VALUE_TEXT_MAX) {
     text = `${text.slice(0, BOT_VALUE_TEXT_MAX - 1)}…`;
   }
   const value = { id: task.id !== undefined && task.id !== null ? task.id : null, text };
   if (typeof task.link === "string" && task.link) value.link = task.link;
-  if (typeof task.source === "string" && task.source) value.source = task.source;
+  if (withSource && typeof task.source === "string" && task.source) value.source = task.source;
 
   let json = JSON.stringify(value);
   if (json.length > BUTTON_VALUE_MAX && value.link) {
@@ -177,6 +180,16 @@ function buildBotValue(task) {
     if (value.text === "…") break;
   }
   return json;
+}
+
+/** "home_task_bot" (🤖 Do it) button value: {id, text (≤140), link?, source?}. */
+function buildBotValue(task) {
+  return buildCompactValue(task, true);
+}
+
+/** "home_task_park" (📌 Park for 1:1) button value: {id, text (≤140), link?}. */
+function buildParkValue(task) {
+  return buildCompactValue(task, false);
 }
 
 /**
@@ -300,9 +313,9 @@ function buildProjectsBlocks(projects) {
 /**
  * Builds the "📥 Triage" board blocks: one section+actions pair per task —
  * the section is the task text (hyperlinked to task.link when present), the
- * actions row holds "✅ Complete" and "🤖 Do it" buttons — capped at
- * MAX_TRIAGE_TASKS with an "…and N more" context line. Returns [] when
- * there are no valid tasks.
+ * actions row holds "✅ Complete", "📌 Park for 1:1" and "🤖 Do it" buttons
+ * plus a "🙋 Delegate to..." users_select — capped at MAX_TRIAGE_TASKS with
+ * an "…and N more" context line. Returns [] when there are no valid tasks.
  *
  * @param {Array<{id: string, text: string, source?: string, link?: string,
  *                status?: string}>|undefined} tasks
@@ -353,6 +366,19 @@ function buildTriageBlocks(tasks) {
           text: { type: "plain_text", text: "🤖 Do it", emoji: true },
           action_id: "home_task_bot",
           value: buildBotValue(task),
+        },
+        {
+          type: "button",
+          text: { type: "plain_text", text: "📌 Park for 1:1", emoji: true },
+          action_id: "home_task_park",
+          value: buildParkValue(task),
+        },
+        // Carries no value: the handler recovers the task from the block_id
+        // + sibling buttons' values (same pattern as item_delegate_person).
+        {
+          type: "users_select",
+          action_id: "home_task_delegate",
+          placeholder: { type: "plain_text", text: "🙋 Delegate to...", emoji: true },
         },
       ],
     });
@@ -574,6 +600,7 @@ module.exports = {
   buildDelegatedBlocks,
   buildTaskValue,
   buildBotValue,
+  buildParkValue,
   MAX_TRIAGE_TASKS,
   MAX_DELEGATED_ITEMS,
 };

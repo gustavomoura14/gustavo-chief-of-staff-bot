@@ -56,12 +56,16 @@ const SLACK_API_BASE = process.env.SLACK_API_BASE || "https://slack.com/api";
 //   - "triage_add"    ("Add to Triage" message shortcut): + text, channel,
 //                     message_ts, permalink
 //   - "delegated_to"  (🙋 "Delegate to..." users_select on a brief
-//                     recommendation): shaped { id: "delegated-<ms>", type,
-//                     text, link, to_user_id (the selected Slack user id),
-//                     clickedAt, status, channel, message_ts }
-//   - "park"          (📌 "Park for 1:1" on a brief recommendation): shaped
-//                     { id: "park-<ms>", type, text, link, clickedAt,
-//                     status, channel, message_ts }
+//                     recommendation OR a Home-tab triage row): shaped
+//                     { id: "delegated-<ms>", type, text, link, to_user_id
+//                     (the selected Slack user id), clickedAt, status,
+//                     channel, message_ts } - Home-tab entries carry a
+//                     task_id instead of channel/message_ts
+//   - "park"          (📌 "Park for 1:1" on a brief recommendation OR a
+//                     Home-tab triage row): shaped { id: "park-<ms>", type,
+//                     text, link, clickedAt, status, channel, message_ts } -
+//                     Home-tab entries carry a task_id instead of
+//                     channel/message_ts
 //   - "archive_email" (🗑️ Archive on an actionable section item): shaped
 //                     { id: <item id or "archive-<ms>">, type,
 //                     gmail_thread_id, text, link, clickedAt, status,
@@ -406,6 +410,74 @@ function recoverRecItem(originalBlocks, actionsBlockId) {
   return { itemId, text, link: extractRecLinks(blocks)[itemId] || null };
 }
 
+/** Stable block_id prefixes of each Home triage row's pair (see home.js). */
+const HOME_TASK_BLOCK_ID_PREFIX = "task_";
+const HOME_TASK_ACTIONS_BLOCK_ID_PREFIX = "task_actions_";
+
+/**
+ * Recovers a Home triage task's { taskId, text, link } from the Home view's
+ * blocks, given the clicked element's actions-block block_id
+ * (`task_actions_<id>`). Used by the 🙋 Delegate users_select, which carries
+ * no value: text/link come from a sibling button's value JSON (✅/🤖/📌
+ * values all carry {text, link?}, preferring one that still has the link),
+ * falling back to the `task_<id>` section text with its "<url|text>"
+ * hyperlink unwrapped. Returns null when the click didn't come from a
+ * task_actions_<id> block.
+ *
+ * @param {Array<object>|undefined} viewBlocks - payload.view.blocks
+ * @param {string|undefined} actionsBlockId - the clicked element's block_id
+ * @returns {{taskId: string, text: string, link: string|null}|null}
+ */
+function recoverHomeTask(viewBlocks, actionsBlockId) {
+  if (
+    typeof actionsBlockId !== "string" ||
+    !actionsBlockId.startsWith(HOME_TASK_ACTIONS_BLOCK_ID_PREFIX)
+  ) {
+    return null;
+  }
+  const taskId = actionsBlockId.slice(HOME_TASK_ACTIONS_BLOCK_ID_PREFIX.length);
+  const blocks = Array.isArray(viewBlocks) ? viewBlocks : [];
+
+  let text = "";
+  let link = null;
+  const actionsBlock = blocks.find((b) => b && b.block_id === actionsBlockId);
+  if (actionsBlock && Array.isArray(actionsBlock.elements)) {
+    for (const el of actionsBlock.elements) {
+      if (!el || el.type !== "button" || typeof el.value !== "string") continue;
+      try {
+        const decoded = JSON.parse(el.value);
+        if (decoded && typeof decoded.text === "string" && decoded.text) {
+          if (!text) text = decoded.text;
+          if (typeof decoded.link === "string" && decoded.link) {
+            link = decoded.link;
+            break; // text + link recovered - done
+          }
+        }
+      } catch (err) {
+        // Not a JSON value - keep looking.
+      }
+    }
+  }
+  if (!text) {
+    const sectionBlock = blocks.find(
+      (b) => b && b.block_id === `${HOME_TASK_BLOCK_ID_PREFIX}${taskId}`
+    );
+    if (sectionBlock && sectionBlock.text && typeof sectionBlock.text.text === "string") {
+      // "<icon>[ 🔄] <url|text>" or "<icon>[ 🔄] text" - unwrap the hyperlink.
+      const raw = sectionBlock.text.text;
+      const match = raw.match(/<([^|>]+)\|([^>]*)>/);
+      if (match) {
+        if (!link) link = match[1];
+        text = match[2];
+      } else {
+        text = raw.replace(/^\S+\s*/, "");
+      }
+    }
+  }
+
+  return { taskId, text, link };
+}
+
 /**
  * POSTs a replace_original message update to a block_actions response_url.
  * Failures are logged with `context` (the acting action_id), never thrown -
@@ -682,6 +754,137 @@ async function processInteraction(payload) {
         });
       if (changed || newBlocks.length < view.blocks.length) {
         await republishHomeView(userId, newBlocks, "home_task_bot");
+      }
+    }
+
+    return;
+  }
+
+  // --- Home-tab triage: "📌 Park for 1:1" -----------------------------------
+  // Queue a "park" entry (same type as the brief-side 📌, so the hourly
+  // sweep handles both identically), then (best-effort) re-publish the Home
+  // view with the row's text marked "→ 📌 queued" and its buttons row
+  // removed, so the same task can't be double-parked.
+  if (action.action_id === "home_task_park") {
+    let task;
+    try {
+      task = JSON.parse(action.value);
+    } catch (err) {
+      console.error("home_task_park click carried an unparseable value - ignoring");
+      return;
+    }
+
+    delegations.push({
+      id: `park-${Date.now()}`,
+      type: "park",
+      task_id: task.id !== undefined ? task.id : null,
+      text: task.text || "",
+      link: task.link || null,
+      clickedAt: new Date().toISOString(),
+      status: "pending",
+    });
+    saveDelegations();
+
+    const view = payload.view;
+    const userId = payload.user && payload.user.id;
+    if (
+      view &&
+      view.type === "home" &&
+      Array.isArray(view.blocks) &&
+      userId &&
+      task.id !== undefined &&
+      task.id !== null
+    ) {
+      let changed = false;
+      const newBlocks = view.blocks
+        .filter((block) => !(block && block.block_id === `task_actions_${task.id}`))
+        .map((block) => {
+          if (
+            !block ||
+            block.block_id !== `task_${task.id}` ||
+            !block.text ||
+            typeof block.text.text !== "string"
+          ) {
+            return block;
+          }
+          changed = true;
+          let newText = `${block.text.text} → 📌 queued`;
+          if (newText.length > MAX_SECTION_TEXT) {
+            newText = `${newText.slice(0, MAX_SECTION_TEXT - 1)}…`;
+          }
+          return { ...block, text: { ...block.text, text: newText } };
+        });
+      if (changed || newBlocks.length < view.blocks.length) {
+        await republishHomeView(userId, newBlocks, "home_task_park");
+      }
+    }
+
+    return;
+  }
+
+  // --- Home-tab triage: "🙋 Delegate to..." person picker --------------------
+  // Selecting a person queues a "delegated_to" entry (same type as the
+  // brief-side picker). The select carries no value: the task is recovered
+  // from the block_id + sibling buttons' values (see recoverHomeTask). Then
+  // (best-effort) re-publish the Home view with the row's text marked
+  // "→ 🙋 delegated to <@USER>" and the 📌/🙋/🤖 elements removed - ✅ is
+  // KEPT so the task can still be completed.
+  if (action.action_id === "home_task_delegate") {
+    const selectedUser = action.selected_user;
+    if (!selectedUser) {
+      console.error("home_task_delegate interaction carried no selected_user - ignoring");
+      return;
+    }
+
+    const view = payload.view;
+    const task = recoverHomeTask(view && view.blocks, action.block_id);
+    if (!task) {
+      console.error(
+        `home_task_delegate click outside a ${HOME_TASK_ACTIONS_BLOCK_ID_PREFIX}<id> block - ignoring`
+      );
+      return;
+    }
+
+    delegations.push({
+      id: `delegated-${Date.now()}`,
+      type: "delegated_to",
+      task_id: task.taskId,
+      text: task.text,
+      link: task.link,
+      to_user_id: selectedUser,
+      clickedAt: new Date().toISOString(),
+      status: "pending",
+    });
+    saveDelegations();
+
+    const userId = payload.user && payload.user.id;
+    if (view && view.type === "home" && Array.isArray(view.blocks) && userId) {
+      let changed = false;
+      const newBlocks = view.blocks.map((block) => {
+        if (!block) return block;
+        if (block.block_id === action.block_id && Array.isArray(block.elements)) {
+          changed = true;
+          return {
+            ...block,
+            elements: block.elements.filter((el) => el && el.action_id === "task_complete"),
+          };
+        }
+        if (
+          block.block_id === `${HOME_TASK_BLOCK_ID_PREFIX}${task.taskId}` &&
+          block.text &&
+          typeof block.text.text === "string"
+        ) {
+          changed = true;
+          let newText = `${block.text.text} → 🙋 delegated to <@${selectedUser}>`;
+          if (newText.length > MAX_SECTION_TEXT) {
+            newText = `${newText.slice(0, MAX_SECTION_TEXT - 1)}…`;
+          }
+          return { ...block, text: { ...block.text, text: newText } };
+        }
+        return block;
+      });
+      if (changed) {
+        await republishHomeView(userId, newBlocks, "home_task_delegate");
       }
     }
 
