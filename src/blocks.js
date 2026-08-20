@@ -33,11 +33,15 @@
  *      A divider is inserted between each named section.
  *   4. (optional) recommendations: a bold "Reply-worthy" header, then one
  *      section+actions block pair per recommendation. The section half is
- *      built like a plain item (text + optional link accessory) and carries
- *      a stable `rec_text_<id>` block_id. The actions half carries three
- *      buttons - 🔼 (item_up), 🔽 (item_down), ✅ (item_done) - plus a
- *      fourth "🤖 Do it" button (item_delegate) when the recommendation is
- *      marked `delegatable: true`. Two further extras are CONDITIONAL and
+ *      built like a plain item and carries a stable `rec_text_<id>` block_id
+ *      (done/delegated rows, which get no actions block, keep the legacy
+ *      link accessory instead). The actions half leads with a "🔗 Open"
+ *      LINK button (action_id `item_open__<id>`, client-side, acked as a
+ *      no-op by the interactions handler) when the rec carries a link, then
+ *      carries three buttons - 🔼 (item_up), 🔽 (item_down), ✅ (item_done) -
+ *      plus a fourth "🤖 Do it" button (item_delegate) when the
+ *      recommendation is marked `delegatable: true`. Two further extras are
+ *      CONDITIONAL and
  *      default to off: a "📌 Park for 1:1" button (item_park, static value)
  *      only when the rec is marked `parkable: true`, and a "🙋 Delegate
  *      to..." users_select (item_delegate_person, no value) only when it is
@@ -47,11 +51,13 @@
  *      `{ items: [...all current recommendations, in order...], actedId }`,
  *      so the whole ordered list travels with every click. No DB, no
  *      server-side state. To stay under Slack's 2000-char limit on button
- *      values, stored items carry only {id, text (truncated), done}, plus
- *      `d:1` when delegatable, `p:1` when parkable, `dp:1` when
- *      person-delegatable and `delegated:true` once delegated - links
- *      are NOT stored; the interactions handler recovers them from the
- *      original message's `rec_text_<id>` accessory URLs.
+ *      values, stored items carry {id, text (truncated), done, link (kept
+ *      only while the total value stays under ~1900 chars - dropped
+ *      wholesale otherwise)}, plus `d:1` when delegatable, `p:1` when
+ *      parkable, `dp:1` when person-delegatable and `delegated:true` once
+ *      delegated; when links were dropped, the interactions handler recovers
+ *      them from the original message's 🔗 Open button URLs (or legacy
+ *      `rec_text_<id>` accessory URLs).
  *
  *      Delegated items (🤖 Do it was clicked) stay in place - not done, not
  *      sorted last - rendered as "🤖 _queued: text_" with ALL buttons
@@ -71,6 +77,7 @@ const MAX_SECTION_TEXT = 2990; // Slack section text cap is 3000 chars
 const MAX_BUTTON_VALUE = 2000; // Slack button `value` cap
 const MAX_BLOCK_ID = 255; // Slack `block_id` cap
 const MAX_ACTIONS_ELEMENTS = 25; // Slack cap on elements per `actions` block
+const MAX_BUTTON_URL = 3000; // Slack button `url` cap
 
 /**
  * Truncates `text` to at most `max` chars, appending "…" when trimmed.
@@ -489,9 +496,9 @@ function isPersonDelegatable(rec) {
 /**
  * Stable per-recommendation block_id prefix for the section half of each
  * recommendation pair (and for done items). The interactions handler uses
- * these to recover each recommendation's link (its accessory URL) from the
- * original message's blocks, since links are deliberately NOT stored in
- * button values (see buildActionValue).
+ * these (plus the paired `rec_actions_<id>` 🔗 Open button URLs) to recover
+ * each recommendation's link from the original message's blocks whenever the
+ * link was dropped from button values (see buildActionValue).
  */
 const REC_TEXT_BLOCK_ID_PREFIX = "rec_text_";
 
@@ -561,20 +568,32 @@ function truncateId(rawId) {
 }
 
 /**
+ * Above this total value length, links are dropped from stored items (see
+ * buildActionValue). Kept comfortably below MAX_BUTTON_VALUE so JSON-escaping
+ * overhead can never push the final string past Slack's hard cap.
+ */
+const STORED_LINKS_SOFT_MAX = 1900;
+
+/**
  * Strips a recommendation down to the {id, text, done} shape that travels
  * in button `value` payloads, plus a compact `d: 1` flag when the item is
  * delegatable (omitted otherwise, to save value bytes) and `delegated: true`
- * once it has been queued via 🤖 Do it. Links are intentionally NOT
- * included: with long URLs (e.g. Google Calendar deep links) they blow past
+ * once it has been queued via 🤖 Do it. Links ARE included when `withLinks`
+ * is true (so rebuilt rows keep their 🔗 Open button even when the original
+ * blocks can't be consulted); buildActionValue drops them wholesale (never
+ * truncated - a cut URL is useless) when the total payload would approach
  * Slack's 2000-char cap on button values, which Slack rejects with
- * invalid_blocks. The interactions handler recovers links from the original
- * message blocks instead (via REC_TEXT_BLOCK_ID_PREFIX block_ids).
+ * invalid_blocks. The interactions handler ALSO recovers links from the
+ * original message blocks (via extractRecLinks) as a fallback, so a dropped
+ * link only degrades rows rebuilt without access to the original message.
  *
- * @param {{id: string, text: string, done?: boolean, delegatable?: boolean, delegated?: boolean}} rec
+ * @param {{id: string, text: string, link?: string, done?: boolean, delegatable?: boolean, delegated?: boolean}} rec
  * @param {number} textCap - max stored text length
+ * @param {boolean} withLinks - include `link` in the stored shape
  */
-function toStoredItem(rec, textCap) {
+function toStoredItem(rec, textCap, withLinks) {
   const stored = { id: rec.id, text: truncate(String(rec.text == null ? "" : rec.text), textCap), done: !!rec.done };
+  if (withLinks && typeof rec.link === "string" && rec.link) stored.link = rec.link;
   if (isDelegatable(rec)) stored.d = 1;
   // `p` / `dp` mirror `d`: without them the 📌/🙋 extras would silently
   // disappear from every row the first time any 🔼/🔽/✅ click rebuilds the
@@ -587,8 +606,12 @@ function toStoredItem(rec, textCap) {
 
 /**
  * Builds the JSON `value` string carried by every 🔼/🔽/✅ button, keeping
- * it under Slack's 2000-char button-value limit by progressively shrinking
- * the per-item stored-text cap until it fits.
+ * it under Slack's 2000-char button-value limit. Links are included while
+ * the whole payload fits under STORED_LINKS_SOFT_MAX; past that, the LONGEST
+ * stored link is dropped (whole, never truncated - a cut URL is useless),
+ * repeating until the payload fits, so one pathological URL costs only
+ * itself. If the value still overflows with every link gone, the per-item
+ * stored-text cap is progressively shrunk until it fits, exactly as before.
  *
  * @param {Array<object>} allRecommendations - full ordered list
  * @param {string} actedId
@@ -596,14 +619,28 @@ function toStoredItem(rec, textCap) {
  */
 function buildActionValue(allRecommendations, actedId) {
   let cap = 150;
-  let value = JSON.stringify({
-    items: allRecommendations.map((rec) => toStoredItem(rec, cap)),
-    actedId,
-  });
+  const items = allRecommendations.map((rec) => toStoredItem(rec, cap, true));
+  let value = JSON.stringify({ items, actedId });
+
+  while (value.length > STORED_LINKS_SOFT_MAX) {
+    let longest = -1;
+    items.forEach((item, index) => {
+      if (
+        typeof item.link === "string" &&
+        (longest === -1 || item.link.length > items[longest].link.length)
+      ) {
+        longest = index;
+      }
+    });
+    if (longest === -1) break; // no links left to drop
+    delete items[longest].link;
+    value = JSON.stringify({ items, actedId });
+  }
+
   while (value.length > MAX_BUTTON_VALUE && cap > 10) {
     cap = Math.floor(cap / 2);
     value = JSON.stringify({
-      items: allRecommendations.map((rec) => toStoredItem(rec, cap)),
+      items: allRecommendations.map((rec) => toStoredItem(rec, cap, false)),
       actedId,
     });
   }
@@ -681,6 +718,29 @@ function buildRecommendationPairBlocks(allRecommendations, recommendation, rank,
   const elements = compact
     ? [button("item_done", "✅")]
     : [button("item_up", "🔼"), button("item_down", "🔽"), button("item_done", "✅")];
+
+  // "🔗 Open" (action_id `item_open__<id>`): a LINK button, FIRST in the row,
+  // shown when the recommendation carries a link. Slack opens the URL
+  // client-side but still fires a block_actions event - the interactions
+  // handler treats any `item_open*` action_id as an acked no-op. It replaces
+  // the old right-aligned section accessory (dropped just below) so the row
+  // shows exactly one Open affordance; done/delegated rows, which have no
+  // actions block, keep the accessory instead. The interactions handler
+  // recovers links from this button's `url` (or the legacy accessory) via
+  // extractRecLinks. Skipped for URLs past Slack's 3000-char button-url cap.
+  if (
+    typeof recommendation.link === "string" &&
+    recommendation.link &&
+    recommendation.link.length <= MAX_BUTTON_URL
+  ) {
+    elements.unshift({
+      type: "button",
+      action_id: `item_open__${recommendation.id}`,
+      text: { type: "plain_text", text: "🔗 Open", emoji: true },
+      url: recommendation.link,
+    });
+  }
+  delete sectionBlock.accessory;
   if (isDelegatable(recommendation)) {
     elements.push(button("item_delegate", "🤖 Do it"));
   }

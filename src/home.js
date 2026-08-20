@@ -32,12 +32,13 @@
  *      "🎉 Inbox Zero!" header when current === 0
  *   5. (when `tasks` is a non-empty array) a "📥 Triage" board: one
  *      section+actions pair per task — the section is source icon + text
- *      (hyperlinked to task.link when present), the actions row holds a
- *      "✅ Complete" button (action_id "task_complete"), a "🤖 Do it"
- *      button (action_id "home_task_bot"), a "📌 Park for 1:1" button
- *      (action_id "home_task_park") and a "🙋 Delegate to..." users_select
- *      (action_id "home_task_delegate") — capped at MAX_TRIAGE_TASKS rows
- *      plus an "…and N more" context line
+ *      (hyperlinked to task.link when present), the actions row leads with a
+ *      "🔗 Open" link button (action_id "item_open__<id>", client-side, only
+ *      when the task has a link) then holds a "✅ Complete" button (action_id
+ *      "task_complete"), a "🤖 Do it" button (action_id "home_task_bot"), a
+ *      "📌 Park for 1:1" button (action_id "home_task_park") and a
+ *      "🙋 Delegate to..." users_select (action_id "home_task_delegate") —
+ *      capped at MAX_TRIAGE_TASKS rows plus an "…and N more" context line
  *   5b. (when `delegated` is a non-empty array) a "🙋 Delegated" section:
  *      one line per item - "🟢/🟡/🔴 <text> → <to> (<days>d)" with an inline
  *      "open" link when present - capped at MAX_DELEGATED_ITEMS items.
@@ -58,6 +59,10 @@ const MAX_TRIAGE_TASKS = 20;
 
 // Slack caps a button's `value` at 2000 characters.
 const BUTTON_VALUE_MAX = 2000;
+
+// Slack caps a button's `url` at 3000 characters (a longer link renders no
+// 🔗 Open button - the section text keeps its inline hyperlink regardless).
+const BUTTON_URL_MAX = 3000;
 
 const TASK_SOURCE_ICONS = { slack: "💬", email: "📧", manual: "📝" };
 
@@ -313,9 +318,10 @@ function buildProjectsBlocks(projects) {
 /**
  * Builds the "📥 Triage" board blocks: one section+actions pair per task —
  * the section is the task text (hyperlinked to task.link when present), the
- * actions row holds "✅ Complete", "📌 Park for 1:1" and "🤖 Do it" buttons
- * plus a "🙋 Delegate to..." users_select — capped at MAX_TRIAGE_TASKS with
- * an "…and N more" context line. Returns [] when there are no valid tasks.
+ * actions row leads with a "🔗 Open" link button (when the task has a link)
+ * then holds "✅ Complete", "🤖 Do it" and "📌 Park for 1:1" buttons plus a
+ * "🙋 Delegate to..." users_select — capped at MAX_TRIAGE_TASKS with an
+ * "…and N more" context line. Returns [] when there are no valid tasks.
  *
  * @param {Array<{id: string, text: string, source?: string, link?: string,
  *                status?: string}>|undefined} tasks
@@ -351,36 +357,51 @@ function buildTriageBlocks(tasks) {
       block_id: `task_${taskId}`,
       text: { type: "mrkdwn", text },
     });
+    const elements = [];
+    // "🔗 Open" (action_id `item_open__<id>`): a LINK button, FIRST in the
+    // row, when the task carries a link. Slack opens the URL client-side but
+    // still fires a block_actions event - the interactions handler treats any
+    // `item_open*` action_id as an acked no-op. The id suffix is capped so
+    // the action_id stays inside Slack's 255-char limit.
+    if (hasLink && task.link.length <= BUTTON_URL_MAX) {
+      elements.push({
+        type: "button",
+        action_id: `item_open__${String(taskId).slice(0, 240)}`,
+        text: { type: "plain_text", text: "🔗 Open", emoji: true },
+        url: task.link,
+      });
+    }
+    elements.push(
+      {
+        type: "button",
+        text: { type: "plain_text", text: "✅ Complete", emoji: true },
+        action_id: "task_complete",
+        value: buildTaskValue(task),
+      },
+      {
+        type: "button",
+        text: { type: "plain_text", text: "🤖 Do it", emoji: true },
+        action_id: "home_task_bot",
+        value: buildBotValue(task),
+      },
+      {
+        type: "button",
+        text: { type: "plain_text", text: "📌 Park for 1:1", emoji: true },
+        action_id: "home_task_park",
+        value: buildParkValue(task),
+      },
+      // Carries no value: the handler recovers the task from the block_id
+      // + sibling buttons' values (same pattern as item_delegate_person).
+      {
+        type: "users_select",
+        action_id: "home_task_delegate",
+        placeholder: { type: "plain_text", text: "🙋 Delegate to...", emoji: true },
+      }
+    );
     blocks.push({
       type: "actions",
       block_id: `task_actions_${taskId}`,
-      elements: [
-        {
-          type: "button",
-          text: { type: "plain_text", text: "✅ Complete", emoji: true },
-          action_id: "task_complete",
-          value: buildTaskValue(task),
-        },
-        {
-          type: "button",
-          text: { type: "plain_text", text: "🤖 Do it", emoji: true },
-          action_id: "home_task_bot",
-          value: buildBotValue(task),
-        },
-        {
-          type: "button",
-          text: { type: "plain_text", text: "📌 Park for 1:1", emoji: true },
-          action_id: "home_task_park",
-          value: buildParkValue(task),
-        },
-        // Carries no value: the handler recovers the task from the block_id
-        // + sibling buttons' values (same pattern as item_delegate_person).
-        {
-          type: "users_select",
-          action_id: "home_task_delegate",
-          placeholder: { type: "plain_text", text: "🙋 Delegate to...", emoji: true },
-        },
-      ],
+      elements,
     });
   });
 

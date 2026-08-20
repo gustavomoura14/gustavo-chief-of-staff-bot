@@ -143,9 +143,30 @@ function requireInternalSecret(req, res, next) {
 // ---------------------------------------------------------------------------
 // GET /healthz - trivial health check. Also used as a keep-warm ping target
 // (see README) so /slack/interactions stays responsive on free-tier hosting.
+// Reports the running build's short git SHA so deploys can be verified from
+// the outside. Computed ONCE at startup: Render exposes the deployed commit
+// as RENDER_GIT_COMMIT; local checkouts fall back to `git rev-parse`.
 // ---------------------------------------------------------------------------
+const BUILD_VERSION = (() => {
+  if (typeof process.env.RENDER_GIT_COMMIT === "string" && process.env.RENDER_GIT_COMMIT) {
+    return process.env.RENDER_GIT_COMMIT.slice(0, 7);
+  }
+  try {
+    const sha = require("child_process")
+      .execSync("git rev-parse --short HEAD", {
+        cwd: __dirname,
+        stdio: ["ignore", "pipe", "ignore"],
+      })
+      .toString()
+      .trim();
+    return sha || "unknown";
+  } catch (err) {
+    return "unknown";
+  }
+})();
+
 app.get("/healthz", (req, res) => {
-  res.json({ status: "ok" });
+  res.json({ status: "ok", version: BUILD_VERSION });
 });
 
 // ---------------------------------------------------------------------------
@@ -326,11 +347,17 @@ function mergeUpdatedBlocks(originalBlocks, newRecsBlocks) {
   return [...originalBlocks.slice(0, headerIndex), ...newRecsBlocks];
 }
 
+/** Stable block_id prefix of each recommendation's buttons row (see blocks.js). */
+const REC_ACTIONS_BLOCK_ID_PREFIX = "rec_actions_";
+
 /**
  * Recovers each recommendation's link from the original message's blocks.
- * Button `value` payloads deliberately do NOT carry links (long URLs would
- * blow Slack's 2000-char button-value cap), so on every interaction we read
- * them back from the `rec_text_<id>` section blocks' accessory URLs.
+ * Button `value` payloads only carry links while the whole value fits under
+ * ~1900 chars (long URLs would blow Slack's 2000-char button-value cap), so
+ * on every interaction we also read them back from the message itself: the
+ * `rec_actions_<id>` rows' 🔗 Open button URLs (current renders) and the
+ * `rec_text_<id>` section blocks' accessory URLs (done/delegated rows, and
+ * messages rendered before the 🔗 Open button existed).
  *
  * @param {Array<object>|undefined} originalBlocks - payload.message.blocks
  * @returns {Object<string, string>} map of recommendation id -> URL
@@ -338,21 +365,30 @@ function mergeUpdatedBlocks(originalBlocks, newRecsBlocks) {
 function extractRecLinks(originalBlocks) {
   const linkById = {};
   (originalBlocks || []).forEach((block) => {
+    if (!block || typeof block.block_id !== "string") return;
     if (
-      block &&
-      typeof block.block_id === "string" &&
       block.block_id.startsWith(REC_TEXT_BLOCK_ID_PREFIX) &&
       block.accessory &&
       typeof block.accessory.url === "string"
     ) {
       linkById[block.block_id.slice(REC_TEXT_BLOCK_ID_PREFIX.length)] = block.accessory.url;
     }
+    if (block.block_id.startsWith(REC_ACTIONS_BLOCK_ID_PREFIX) && Array.isArray(block.elements)) {
+      const openButton = block.elements.find(
+        (el) =>
+          el &&
+          el.type === "button" &&
+          typeof el.action_id === "string" &&
+          el.action_id.startsWith("item_open") &&
+          typeof el.url === "string"
+      );
+      if (openButton) {
+        linkById[block.block_id.slice(REC_ACTIONS_BLOCK_ID_PREFIX.length)] = openButton.url;
+      }
+    }
   });
   return linkById;
 }
-
-/** Stable block_id prefix of each recommendation's buttons row (see blocks.js). */
-const REC_ACTIONS_BLOCK_ID_PREFIX = "rec_actions_";
 
 /**
  * Recovers a recommendation's { itemId, text, link } from the original
@@ -866,7 +902,14 @@ async function processInteraction(payload) {
           changed = true;
           return {
             ...block,
-            elements: block.elements.filter((el) => el && el.action_id === "task_complete"),
+            // ✅ stays so the task can still be completed; the 🔗 Open link
+            // button (item_open__<id>), when present, stays too.
+            elements: block.elements.filter(
+              (el) =>
+                el &&
+                (el.action_id === "task_complete" ||
+                  (typeof el.action_id === "string" && el.action_id.startsWith("item_open")))
+            ),
           };
         }
         if (
@@ -1101,7 +1144,18 @@ async function processInteraction(payload) {
         if (newText.length > MAX_SECTION_TEXT) {
           newText = `${newText.slice(0, MAX_SECTION_TEXT - 1)}…`;
         }
-        return { ...block, text: { ...block.text, text: newText } };
+        const parked = { ...block, text: { ...block.text, text: newText } };
+        // The row's actions block (holding its 🔗 Open link button) was just
+        // removed - re-attach the link as a section accessory so a parked
+        // item keeps its Open affordance.
+        if (!parked.accessory && item.link) {
+          parked.accessory = {
+            type: "button",
+            text: { type: "plain_text", text: "Open", emoji: true },
+            url: item.link,
+          };
+        }
+        return parked;
       });
 
     await postResponseUrlUpdate(responseUrl, newBlocks, "item_park");
@@ -1167,12 +1221,14 @@ async function processInteraction(payload) {
   }
 
   // --- Link buttons / unknown actions -------------------------------------
-  // Link buttons (e.g. the 🎙️ "Hear it" voice_open button) are handled
-  // entirely client-side by Slack - the URL opens in the browser - but
-  // Slack STILL sends a block_actions event for the click. It was already
-  // acked with an empty 200 (as is any other unrecognized action_id, e.g.
-  // the post-queue `brief_refresh_queued` no-op button), so there is
-  // nothing left to do and clicks never surface an error in Slack.
+  // Link buttons (the 🔗 Open `item_open__<id>` buttons on brief and Home
+  // rows, and the 🎙️ "Hear it" voice_open button) are handled entirely
+  // client-side by Slack - the URL opens in the browser - but Slack STILL
+  // sends a block_actions event for the click. It was already acked with an
+  // empty 200 (as is any other unrecognized action_id, e.g. the post-queue
+  // `brief_refresh_queued` no-op button), so there is nothing left to do:
+  // no delegation entry is ever enqueued for them and clicks never surface
+  // an error in Slack.
   const KNOWN_BRIEF_ACTIONS = new Set(["item_up", "item_down", "item_done", "item_delegate"]);
   if (!KNOWN_BRIEF_ACTIONS.has(action.action_id)) {
     return;
@@ -1465,5 +1521,30 @@ app.post("/delegations/complete", requireInternalSecret, express.json(), async (
 app.listen(PORT, () => {
   console.log(`Chief of Staff bot listening on port ${PORT}`);
 });
+
+// ---------------------------------------------------------------------------
+// Keep-warm self-ping. The external cron-job.org pinger (see README) only
+// covers limited days/hours, so while THIS process is alive it also GETs its
+// own public /healthz every 5 minutes - inbound traffic that stops Render's
+// free-tier ~15-min inactivity spin-down. NOTE: a self-ping can only prevent
+// sleep while the process is running; it cannot WAKE an instance that has
+// already spun down (or was restarted by a platform incident), so the
+// external pinger remains the wake-up path. Best-effort and silent: failures
+// are swallowed, and the timer is unref'd so it never keeps a test process
+// alive. Set KEEP_WARM=off to disable (e.g. for local runs).
+const KEEP_WARM_URL = `${
+  process.env.RENDER_EXTERNAL_URL || "https://gustavo-chief-of-staff-bot-1.onrender.com"
+}/healthz`;
+const KEEP_WARM_INTERVAL_MS = 5 * 60 * 1000;
+if (process.env.KEEP_WARM !== "off") {
+  const keepWarmTimer = setInterval(() => {
+    try {
+      fetch(KEEP_WARM_URL).catch(() => {});
+    } catch (err) {
+      // fetch unavailable or threw synchronously - never crash over a ping.
+    }
+  }, KEEP_WARM_INTERVAL_MS);
+  if (typeof keepWarmTimer.unref === "function") keepWarmTimer.unref();
+}
 
 module.exports = app;
