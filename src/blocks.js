@@ -56,6 +56,12 @@
  *      Delegated items (🤖 Do it was clicked) stay in place - not done, not
  *      sorted last - rendered as "🤖 _queued: text_" with ALL buttons
  *      removed.
+ *
+ *      Recommendation ids are normalized before anything is built (see
+ *      withUniqueRecIds): each rec's id becomes the suffix of two block_ids,
+ *      and Slack rejects an entire message with `invalid_blocks` if any two
+ *      blocks share a block_id - so missing or repeated ids are filled in /
+ *      de-duplicated rather than allowed to collide.
  */
 
 // Slack hard limits we render against.
@@ -63,6 +69,8 @@ const SLACK_MAX_BLOCKS = 50;
 const SOFT_MAX_BLOCKS = 45; // our own guard threshold, comfortably below 50
 const MAX_SECTION_TEXT = 2990; // Slack section text cap is 3000 chars
 const MAX_BUTTON_VALUE = 2000; // Slack button `value` cap
+const MAX_BLOCK_ID = 255; // Slack `block_id` cap
+const MAX_ACTIONS_ELEMENTS = 25; // Slack cap on elements per `actions` block
 
 /**
  * Truncates `text` to at most `max` chars, appending "…" when trimmed.
@@ -488,6 +496,71 @@ function isPersonDelegatable(rec) {
 const REC_TEXT_BLOCK_ID_PREFIX = "rec_text_";
 
 /**
+ * Longest recommendation id we will build a block_id from. Both prefixes
+ * (`rec_text_`, `rec_actions_`) plus a `__<n>` de-duplication suffix have to
+ * fit inside Slack's 255-char block_id cap; 230 leaves ample headroom.
+ */
+const MAX_REC_ID = 230;
+
+/**
+ * Returns `recommendations` with a NON-EMPTY, UNIQUE, string `id` on every
+ * entry.
+ *
+ * Every recommendation contributes two block_ids to the message
+ * (`rec_text_<id>` and `rec_actions_<id>`), and Slack rejects the whole
+ * message with `invalid_blocks` when any two blocks share a block_id. A
+ * payload whose recs omit `id` collapsed every row onto
+ * `rec_text_undefined` / `rec_actions_undefined`, and repeated ids collided
+ * the same way - so a single malformed field made the entire brief
+ * unpostable rather than degrading one row.
+ *
+ * Ids are also what travel in button `value` payloads and what
+ * `recoverRecItem` slices back out of a clicked block_id, so normalizing
+ * here - once, before both the blocks and the button values are built - is
+ * what keeps those two representations agreeing with each other.
+ *
+ * The mapping is deterministic and idempotent: ids that are already unique
+ * and in range are returned untouched, so rebuilding the list from a button
+ * value after a 🔼/🔽/✅ click yields exactly the same ids as the original
+ * render.
+ *
+ * @param {Array<object|string>} recommendations
+ * @returns {Array<object>} same length and order, every entry with a good id
+ */
+function withUniqueRecIds(recommendations) {
+  const seen = new Set();
+  return (recommendations || []).map((rec, index) => {
+    const item = rec && typeof rec === "object" ? rec : { text: rec };
+    let base = truncateId(item.id);
+    if (!base) base = `rec_${index + 1}`;
+
+    let id = base;
+    let suffix = 2;
+    while (seen.has(id)) {
+      id = `${base}__${suffix}`;
+      suffix += 1;
+    }
+    seen.add(id);
+
+    return item.id === id ? item : { ...item, id };
+  });
+}
+
+/**
+ * Coerces a recommendation id to a trimmed string of at most MAX_REC_ID
+ * chars, returning "" for anything that cannot yield a usable id (null,
+ * undefined, empty/whitespace strings, objects).
+ *
+ * @param {*} rawId
+ * @returns {string}
+ */
+function truncateId(rawId) {
+  if (rawId == null) return "";
+  if (typeof rawId === "object") return "";
+  return String(rawId).trim().slice(0, MAX_REC_ID);
+}
+
+/**
  * Strips a recommendation down to the {id, text, done} shape that travels
  * in button `value` payloads, plus a compact `d: 1` flag when the item is
  * delegatable (omitted otherwise, to save value bytes) and `delegated: true`
@@ -645,14 +718,55 @@ function buildRecommendationPairBlocks(allRecommendations, recommendation, rank,
     });
   }
 
+  // Defence in depth: an `actions` block with zero elements - or holding a
+  // `false`/`undefined` entry left behind by a conditional push - is rejected
+  // by Slack with `invalid_blocks`, taking the WHOLE message down rather than
+  // just that row. Drop anything malformed, and emit no actions block at all
+  // when nothing survives (a lone section block is perfectly legal).
+  const safeElements = elements.filter(isValidActionElement).slice(0, MAX_ACTIONS_ELEMENTS);
+
+  if (safeElements.length === 0) {
+    return [sectionBlock];
+  }
+
   return [
     sectionBlock,
     {
       type: "actions",
+      // Not truncated: withUniqueRecIds already caps ids at MAX_REC_ID so
+      // that prefix + id stays inside MAX_BLOCK_ID. Trimming here would
+      // append an ellipsis and break recoverRecItem's block_id -> id slice.
       block_id: `rec_actions_${recommendation.id}`,
-      elements,
+      elements: safeElements,
     },
   ];
+}
+
+/**
+ * True when `element` is a structurally valid `actions` block element: a
+ * real object carrying a `type` and an `action_id`, with the per-type
+ * requirements Slack enforces (buttons need non-empty text plus either a
+ * `url` or a non-empty `value` within the 2000-char cap; selects need a
+ * non-empty placeholder).
+ *
+ * @param {*} element
+ * @returns {boolean}
+ */
+function isValidActionElement(element) {
+  if (!element || typeof element !== "object") return false;
+  if (!element.type || !element.action_id) return false;
+
+  if (element.type === "button") {
+    if (!element.text || !element.text.text) return false;
+    if (typeof element.value === "string" && element.value.length > MAX_BUTTON_VALUE) return false;
+    if (!element.url && !element.value) return false;
+  }
+
+  if (element.type.endsWith("_select") && !(element.placeholder && element.placeholder.text)) {
+    return false;
+  }
+
+  return true;
 }
 
 /**
@@ -668,7 +782,10 @@ function buildRecommendationPairBlocks(allRecommendations, recommendation, rank,
  * @returns {Array<object>}
  */
 function buildRecommendationsBlocks(recommendations) {
-  const items = recommendations || [];
+  // Normalize ids ONCE, up front: every downstream consumer (block_ids,
+  // button values, applyAction's id lookup) reads from this same array, so
+  // they cannot disagree about what a given row's id is.
+  const items = withUniqueRecIds(recommendations);
   const titleBlock = buildTitleBlock(RECOMMENDATIONS_TITLE);
   titleBlock.block_id = RECS_HEADER_BLOCK_ID;
   const blocks = [titleBlock];
