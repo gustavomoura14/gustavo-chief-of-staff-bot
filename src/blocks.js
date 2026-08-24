@@ -16,16 +16,26 @@
  *       queues a "refresh" delegation entry
  *   3. for each entry in `sections`: consecutive PLAIN items (strings or
  *      {text, link?, flag?} objects) are condensed into ONE section block -
- *      the bold title on the first line, then one "• item" line per item
- *      (flag as an italic suffix, link as an inline `<url|open>` mrkdwn
- *      link) - keeping the whole message well under Slack's hard cap of 50
- *      blocks per message. Two further item shapes exist:
- *        - ACTIONABLE items ({text, link?, id, action: {type, ...}}) render
- *          as their own section block (text hyperlinked to `link` when
- *          present) with an accessory button: action.type "archive_email" →
- *          "🗑️ Archive" (action_id `sec_item_archive`), "done" → "✅ Done"
- *          (action_id `sec_item_done`). The button value is a compact JSON
- *          {id, type, gmail_thread_id?, text (truncated), link?}.
+ *      the bold title on the first line (hyperlinked when the section
+ *      carries a `title_link`, or when the title looks like "Ben 1:1 prep" -
+ *      see sectionTitleMrkdwn), then one "• item" line per item (flag as an
+ *      italic suffix, link as an inline `<url|open>` mrkdwn link) - keeping
+ *      the whole message well under Slack's hard cap of 50 blocks per
+ *      message. Three further item shapes exist:
+ *        - ACTIONABLE items ({text, link?, id, action: {type, ...}, due?,
+ *          draft?}) render as their own section block (text hyperlinked to
+ *          `link` when usable) with an accessory button - action.type
+ *          "archive_email" → "🗑️ Archive" (action_id `sec_item_archive`),
+ *          "done" → "✅ Done" (action_id `sec_item_done`) - plus an actions
+ *          row (block_id `sec_item_actions_<id>`) holding "⏰ Snooze"
+ *          (`sec_item_snooze`, value carries `due` when set) and "✖️ Not for
+ *          me" (`sec_item_dismiss`), and a "📝 View draft" button when the
+ *          item carries a `draft` string. Button values are compact JSON
+ *          {id, type, gmail_thread_id?, due?, text (truncated), link?}.
+ *        - DRAFT items ({text, link?, draft}, no action) render as their own
+ *          section block with a "📝 View draft" accessory button (action_id
+ *          `sec_item_view_draft`, value {type: "view_draft", draft}) - the
+ *          interactions handler opens a display-only modal with the draft.
  *        - CALENDAR items ({time, title, link?, note?}, no action) render as
  *          compact "`8:00–9:00`  *<link|Title>* — note" lines, one section
  *          block per run of consecutive calendar items (no per-item blocks
@@ -62,6 +72,9 @@
  *      Delegated items (🤖 Do it was clicked) stay in place - not done, not
  *      sorted last - rendered as "🤖 _queued: text_" with ALL buttons
  *      removed.
+ *   5. footer: a context block with a "📊 View all in Home" mrkdwn link
+ *      pointing at the app's Home tab via Slack's https app_redirect URL
+ *      (see buildHomeFooterBlock).
  *
  *      Recommendation ids are normalized before anything is built (see
  *      withUniqueRecIds): each rec's id becomes the suffix of two block_ids,
@@ -90,6 +103,25 @@ function truncate(text, max) {
   if (typeof text !== "string") text = String(text == null ? "" : text);
   if (text.length <= max) return text;
   return text.slice(0, Math.max(0, max - 1)) + "…";
+}
+
+/**
+ * Returns `link` verbatim when it is a usable button/anchor URL - a non-empty
+ * http(s) string within Slack's 3000-char button-url cap - and null
+ * otherwise. Every Open button/accessory is gated on this: an item with a
+ * missing or invalid link renders NO Open affordance at all. There is
+ * DELIBERATELY no fallback URL anywhere - an Open button either uses the
+ * item's own link verbatim or does not exist (a substituted default link,
+ * e.g. a canvas, would point the button at the wrong destination).
+ *
+ * @param {*} link
+ * @returns {string|null}
+ */
+function usableLink(link) {
+  if (typeof link !== "string") return null;
+  if (!/^https?:\/\//i.test(link)) return null;
+  if (link.length > MAX_BUTTON_URL) return null;
+  return link;
 }
 
 /**
@@ -151,7 +183,7 @@ function buildItemSectionBlock(item) {
     },
   };
 
-  if (item.link) {
+  if (usableLink(item.link)) {
     block.accessory = {
       type: "button",
       text: {
@@ -263,8 +295,20 @@ const SEC_ITEM_BUTTONS = {
 const SEC_ITEM_VALUE_TEXT_MAX = 140;
 const SEC_ITEM_VALUE_SOFT_MAX = 1800;
 
+// A snooze value's `due` (the item's own due date, passed through verbatim)
+// is capped so it can never blow the button-value budget.
+const SEC_ITEM_VALUE_DUE_MAX = 40;
+
 /** Stable block_id prefix for actionable section-item blocks. */
 const SEC_ITEM_BLOCK_ID_PREFIX = "sec_item_";
+
+/**
+ * Stable block_id prefix for the ⏰/✖️ (and optional "View draft") actions
+ * row rendered under each actionable section item. The interactions handler
+ * derives one id from the other (`sec_item_<id>` <-> `sec_item_actions_<id>`)
+ * to strike the item and drop its buttons together.
+ */
+const SEC_ITEM_ACTIONS_BLOCK_ID_PREFIX = "sec_item_actions_";
 
 /**
  * True when a section item is an ACTIONABLE object - it carries an `action`
@@ -318,34 +362,56 @@ function calendarItemMrkdwn(item) {
 }
 
 /**
- * Builds the section block for one ACTIONABLE item: mrkdwn text (hyperlinked
- * to `item.link` when present) with an accessory 🗑️ Archive / ✅ Done button.
- * The button value is a compact JSON {id, type, gmail_thread_id?, text
- * (truncated), link?}; the link is dropped from the value (never truncated -
- * a cut URL is useless) if it would push the JSON near Slack's 2000-char cap.
+ * Builds a compact sec_item_* button `value` JSON: {id, type, text
+ * (truncated), link?, plus any `extra` fields (e.g. gmail_thread_id, due)}.
+ * The link is dropped (never truncated - a cut URL is useless) if it would
+ * push the JSON near Slack's 2000-char cap.
  *
- * @param {{text: string, link?: string, id?: string, action: {type: string, gmail_thread_id?: string}}} item
- * @returns {object} Slack Block Kit `section` block
+ * @param {{text?: any, link?: string, id?: string}} item
+ * @param {string} type - the delegation type this button queues
+ * @param {object} [extra] - additional short fields to carry
+ * @returns {string} JSON string
  */
-function buildActionItemBlock(item) {
-  const config = SEC_ITEM_BUTTONS[item.action.type];
-  const text = String(item.text == null ? "" : item.text);
-
-  const value = { id: item.id, type: item.action.type };
-  if (typeof item.action.gmail_thread_id === "string") {
-    value.gmail_thread_id = item.action.gmail_thread_id;
-  }
-  value.text = truncate(text, SEC_ITEM_VALUE_TEXT_MAX);
+function buildSecItemValue(item, type, extra) {
+  const value = { id: item.id, type, ...(extra || {}) };
+  value.text = truncate(String(item.text == null ? "" : item.text), SEC_ITEM_VALUE_TEXT_MAX);
   if (typeof item.link === "string") value.link = item.link;
   let valueJson = JSON.stringify(value);
   if (valueJson.length > SEC_ITEM_VALUE_SOFT_MAX) {
     delete value.link;
     valueJson = JSON.stringify(value);
   }
+  return valueJson;
+}
 
-  const mrkdwn = typeof item.link === "string" ? `<${item.link}|${text}>` : text;
+/**
+ * Builds the blocks for one ACTIONABLE item:
+ *   1. a section block - mrkdwn text (hyperlinked to `item.link` when
+ *      usable) with an accessory 🗑️ Archive / ✅ Done button whose value is
+ *      the compact JSON above (plus gmail_thread_id for archives);
+ *   2. an actions row (block_id `sec_item_actions_<id>`) with "⏰ Snooze"
+ *      (action_id `sec_item_snooze`, value carries the item's optional `due`
+ *      date) and "✖️ Not for me" (action_id `sec_item_dismiss`) - clicking
+ *      queues a "snooze" / "dismiss" delegation entry and marks the item in
+ *      place. When the item also carries a `draft` string, a "📝 View draft"
+ *      button (action_id `sec_item_view_draft`) is appended - it opens a
+ *      modal showing the draft, display-only (see buildDraftButton).
+ *
+ * @param {{text: string, link?: string, id?: string, due?: string, draft?: string, action: {type: string, gmail_thread_id?: string}}} item
+ * @returns {Array<object>} [section block, actions block]
+ */
+function buildActionItemBlocks(item) {
+  const config = SEC_ITEM_BUTTONS[item.action.type];
+  const text = String(item.text == null ? "" : item.text);
 
-  return {
+  const extra = {};
+  if (typeof item.action.gmail_thread_id === "string") {
+    extra.gmail_thread_id = item.action.gmail_thread_id;
+  }
+
+  const mrkdwn = usableLink(item.link) ? `<${item.link}|${text}>` : text;
+
+  const sectionBlock = {
     type: "section",
     block_id: `${SEC_ITEM_BLOCK_ID_PREFIX}${item.id}`,
     text: { type: "mrkdwn", text: truncate(mrkdwn, MAX_SECTION_TEXT) },
@@ -353,9 +419,152 @@ function buildActionItemBlock(item) {
       type: "button",
       action_id: config.action_id,
       text: { type: "plain_text", text: config.label, emoji: true },
-      value: valueJson,
+      value: buildSecItemValue(item, item.action.type, extra),
     },
   };
+
+  return [sectionBlock, buildSecItemExtrasBlock(item)];
+}
+
+/**
+ * Builds the ⏰ Snooze / ✖️ Not for me actions row for one section item (see
+ * buildActionItemBlocks). The snooze value additionally carries the item's
+ * `due` date (truncated, optional); a `draft` string appends a "📝 View
+ * draft" button.
+ *
+ * @param {{text: string, link?: string, id?: string, due?: string, draft?: string}} item
+ * @returns {object} Slack Block Kit `actions` block
+ */
+function buildSecItemExtrasBlock(item) {
+  const snoozeExtra = {};
+  if (typeof item.due === "string" && item.due) {
+    snoozeExtra.due = truncate(item.due, SEC_ITEM_VALUE_DUE_MAX);
+  }
+
+  const elements = [
+    {
+      type: "button",
+      action_id: "sec_item_snooze",
+      text: { type: "plain_text", text: "⏰ Snooze", emoji: true },
+      value: buildSecItemValue(item, "snooze", snoozeExtra),
+    },
+    {
+      type: "button",
+      action_id: "sec_item_dismiss",
+      text: { type: "plain_text", text: "✖️ Not for me", emoji: true },
+      value: buildSecItemValue(item, "dismiss"),
+    },
+  ];
+
+  if (typeof item.draft === "string" && item.draft) {
+    elements.push(buildDraftButton(item.draft));
+  }
+
+  return {
+    type: "actions",
+    block_id: `${SEC_ITEM_ACTIONS_BLOCK_ID_PREFIX}${item.id}`,
+    elements,
+  };
+}
+
+// ---------------------------------------------------------------------------
+// "View draft" items (e.g. the Delegated section's ready-to-send nudges)
+// ---------------------------------------------------------------------------
+
+// The draft text travels in the button's `value`; kept under this so JSON
+// escaping can never push it past Slack's 2000-char button-value cap.
+const DRAFT_VALUE_SOFT_MAX = 1900;
+
+/**
+ * True when a section item carries a `draft` string (a ready-to-send nudge
+ * text) but no actionable `action` (actionable items win - they render the
+ * draft button inside their extras row instead).
+ *
+ * @param {any} item
+ * @returns {boolean}
+ */
+function isDraftItem(item) {
+  return !!(
+    item &&
+    typeof item === "object" &&
+    !item.action &&
+    typeof item.draft === "string" &&
+    item.draft
+  );
+}
+
+/**
+ * Builds the "📝 View draft" button (action_id `sec_item_view_draft`). The
+ * value is JSON {type: "view_draft", draft} with the draft text truncated
+ * (shrink-and-recheck, since JSON escaping means char counts don't map 1:1)
+ * to stay under Slack's 2000-char button-value cap. Clicking opens a modal
+ * showing the draft in a copyable code block - display only, nothing is
+ * sent.
+ *
+ * @param {string} draft
+ * @returns {object} Slack Block Kit button element
+ */
+function buildDraftButton(draft) {
+  let text = String(draft);
+  let value = JSON.stringify({ type: "view_draft", draft: text });
+  while (value.length > DRAFT_VALUE_SOFT_MAX && text.length > 1) {
+    const overshoot = value.length - DRAFT_VALUE_SOFT_MAX;
+    text = `${text.slice(0, Math.max(0, text.length - overshoot - 1))}…`;
+    value = JSON.stringify({ type: "view_draft", draft: text });
+  }
+  return {
+    type: "button",
+    action_id: "sec_item_view_draft",
+    text: { type: "plain_text", text: "📝 View draft", emoji: true },
+    value,
+  };
+}
+
+/**
+ * Builds the section block for one DRAFT-carrying plain item: the usual item
+ * mrkdwn (with an inline `<url|open>` link when present, like other plain
+ * items) plus a "📝 View draft" accessory button.
+ *
+ * @param {{text: string, link?: string, flag?: string, draft: string}} raw
+ * @returns {object} Slack Block Kit `section` block
+ */
+function buildDraftItemBlock(raw) {
+  const item = normalizeItem(raw);
+  let line = `• ${itemMrkdwn(item)}`;
+  if (item.link) {
+    line += `  <${item.link}|open>`;
+  }
+  return {
+    type: "section",
+    text: { type: "mrkdwn", text: truncate(line, MAX_SECTION_TEXT) },
+    accessory: buildDraftButton(raw.draft),
+  };
+}
+
+/**
+ * Canvas linked from any section titled like "Ben 1:1 prep" (see
+ * sectionTitleMrkdwn) when the payload carries no explicit `title_link`.
+ */
+const BEN_ONE_ON_ONE_CANVAS_URL =
+  "https://rivian-vw-tech.slack.com/docs/T07MV6787FY/F0AASUBTMJA";
+
+/**
+ * Renders a section's bold title line, hyperlinked when a link applies:
+ * an explicit `title_link` on the section object wins; otherwise a title
+ * that looks like the Ben 1:1 prep section ("ben" and "1:1", any case)
+ * falls back to the hardcoded Ben 1:1 canvas. Sections with neither render
+ * the classic plain bold title.
+ *
+ * @param {{title: string, title_link?: string}} section
+ * @returns {string} mrkdwn
+ */
+function sectionTitleMrkdwn(section) {
+  const title = String(section.title == null ? "" : section.title);
+  let link = usableLink(section.title_link);
+  if (!link && /\bben\b/i.test(title) && title.includes("1:1")) {
+    link = BEN_ONE_ON_ONE_CANVAS_URL;
+  }
+  return link ? `*<${link}|${title}>*` : `*${title}*`;
 }
 
 /**
@@ -363,8 +572,10 @@ function buildActionItemBlock(item) {
  * section block (the bold title leads the first such block, exactly as
  * before - an all-plain section still renders as the single classic block).
  * Runs of consecutive CALENDAR items get one compact-lines block per run,
- * and each ACTIONABLE item gets its own section block with an accessory
- * button (see buildActionItemBlock).
+ * each ACTIONABLE item gets its own section block with an accessory button
+ * plus a ⏰/✖️ actions row (see buildActionItemBlocks), and each DRAFT item
+ * gets its own section block with a "📝 View draft" accessory (see
+ * buildDraftItemBlock).
  *
  * @param {{title: string, items: Array<string|object>}} section
  * @param {number} [maxItems] - when set and the section has more items,
@@ -377,7 +588,7 @@ function buildSectionBlocks(section, maxItems) {
   const shown = maxItems && items.length > maxItems ? items.slice(0, maxItems) : items;
 
   const blocks = [];
-  let plainLines = [`*${section.title}*`]; // title leads the first plain block
+  let plainLines = [sectionTitleMrkdwn(section)]; // title leads the first plain block
   let calendarLines = null; // open run of consecutive calendar items
 
   const pushLinesBlock = (lines) => {
@@ -403,7 +614,11 @@ function buildSectionBlocks(section, maxItems) {
     if (isActionItem(raw)) {
       flushPlain();
       flushCalendar();
-      blocks.push(buildActionItemBlock(raw));
+      blocks.push(...buildActionItemBlocks(raw));
+    } else if (isDraftItem(raw)) {
+      flushPlain();
+      flushCalendar();
+      blocks.push(buildDraftItemBlock(raw));
     } else if (isCalendarItem(raw)) {
       flushPlain();
       if (!calendarLines) calendarLines = [];
@@ -601,6 +816,11 @@ function toStoredItem(rec, textCap, withLinks) {
   if (isParkable(rec)) stored.p = 1;
   if (isPersonDelegatable(rec)) stored.dp = 1;
   if (rec.delegated) stored.delegated = true;
+  // `due` (short, optional) rides along so the ⏰ Snooze button keeps the
+  // item's due date across 🔼/🔽/✅ rebuilds.
+  if (typeof rec.due === "string" && rec.due) {
+    stored.due = truncate(rec.due, SEC_ITEM_VALUE_DUE_MAX);
+  }
   return stored;
 }
 
@@ -727,12 +947,10 @@ function buildRecommendationPairBlocks(allRecommendations, recommendation, rank,
   // shows exactly one Open affordance; done/delegated rows, which have no
   // actions block, keep the accessory instead. The interactions handler
   // recovers links from this button's `url` (or the legacy accessory) via
-  // extractRecLinks. Skipped for URLs past Slack's 3000-char button-url cap.
-  if (
-    typeof recommendation.link === "string" &&
-    recommendation.link &&
-    recommendation.link.length <= MAX_BUTTON_URL
-  ) {
+  // extractRecLinks. Rendered ONLY when the item's own link is usable
+  // (non-empty http(s), within Slack's 3000-char button-url cap) - there is
+  // NO fallback URL: an item without a usable link gets NO Open button.
+  if (usableLink(recommendation.link)) {
     elements.unshift({
       type: "button",
       action_id: `item_open__${recommendation.id}`,
@@ -761,13 +979,36 @@ function buildRecommendationPairBlocks(allRecommendations, recommendation, rank,
     });
   }
 
+  // "⏰ Snooze" (action_id `item_snooze`) and "✖️ Not for me" (action_id
+  // `item_dismiss`): the interactions handler queues a "snooze" / "dismiss"
+  // delegation entry (text/link recovered exactly like 📌 Park), marks the
+  // item in place and removes this actions row. Like 📌, the values are
+  // static markers, not the {items, actedId} payload - the snooze marker
+  // additionally carries the item's `due` date when the payload set one.
+  elements.push({
+    type: "button",
+    action_id: "item_snooze",
+    text: { type: "plain_text", text: "⏰ Snooze", emoji: true },
+    value: JSON.stringify(
+      typeof recommendation.due === "string" && recommendation.due
+        ? { type: "snooze", due: truncate(recommendation.due, SEC_ITEM_VALUE_DUE_MAX) }
+        : { type: "snooze" }
+    ),
+  });
+  elements.push({
+    type: "button",
+    action_id: "item_dismiss",
+    text: { type: "plain_text", text: "✖️ Not for me", emoji: true },
+    value: '{"type":"dismiss"}',
+  });
+
   // "🙋 Delegate to..." user picker (action_id `item_delegate_person`):
   // selecting a person queues a "delegated_to" delegation entry. It carries
   // no value - Slack sends selected_user plus the block context, and the
   // interactions handler recovers the item's text/link from the sibling
   // buttons' values / the rec_text_<id> accessory URL. Row element count
-  // stays at most 6 (🔼🔽✅🤖📌 + this), well under Slack's 25-element cap
-  // on actions blocks.
+  // stays at most 8 (🔼🔽✅🤖📌⏰✖️ + this), well under Slack's 25-element
+  // cap on actions blocks.
   // Rendered ONLY for items flagged `delegatable_person: true` (default
   // false).
   if (isPersonDelegatable(recommendation)) {
@@ -929,6 +1170,31 @@ function buildVoiceButtonBlock() {
 // ---------------------------------------------------------------------------
 
 /**
+ * "View all in Home" footer link target. Slack strips non-http(s) schemes
+ * from mrkdwn links and doesn't document slack:// for button `url`s, so the
+ * https app_redirect URL is used instead - Slack redirects it into this
+ * app's Home in the client. Overridable via HOME_TAB_URL (read at build time
+ * so tests can override it).
+ */
+const DEFAULT_HOME_TAB_URL =
+  "https://slack.com/app_redirect?app=A0BR53L1GE4&team=T07MV6787FY";
+
+/**
+ * Footer context block closing every brief: a "📊 View all in Home" link
+ * pointing at the app's Home tab (rendered as an mrkdwn link in a context
+ * block - no interactivity, Slack handles the redirect client-side).
+ *
+ * @returns {object} Slack Block Kit `context` block
+ */
+function buildHomeFooterBlock() {
+  const url = process.env.HOME_TAB_URL || DEFAULT_HOME_TAB_URL;
+  return {
+    type: "context",
+    elements: [{ type: "mrkdwn", text: `<${url}|📊 View all in Home>` }],
+  };
+}
+
+/**
  * @param {object} payload
  * @param {string} [payload.priority_recap]
  * @param {Array<{title: string, items: Array<object>}>} [payload.sections]
@@ -964,6 +1230,10 @@ function buildBriefBlocks({ priority_recap, sections, recommendations, title, em
       }
       blocks.push(...buildRecommendationsBlocks(recs));
     }
+
+    // Footer: "View all in Home" link. Built inside assemble() so it counts
+    // toward the ≤45-block guard below like every other block.
+    blocks.push(buildHomeFooterBlock());
 
     return blocks;
   };
@@ -1084,5 +1354,7 @@ module.exports = {
   RECOMMENDATIONS_TITLE,
   RECS_HEADER_BLOCK_ID,
   REC_TEXT_BLOCK_ID_PREFIX,
+  SEC_ITEM_BLOCK_ID_PREFIX,
+  SEC_ITEM_ACTIONS_BLOCK_ID_PREFIX,
   MAX_ITEMS_WITH_REORDER_BUTTONS,
 };

@@ -12,6 +12,8 @@ const {
   RECOMMENDATIONS_TITLE,
   RECS_HEADER_BLOCK_ID,
   REC_TEXT_BLOCK_ID_PREFIX,
+  SEC_ITEM_BLOCK_ID_PREFIX,
+  SEC_ITEM_ACTIONS_BLOCK_ID_PREFIX,
 } = require("./blocks");
 const { verifySlackSignature } = require("./verify");
 const { buildHomeView } = require("./home");
@@ -72,6 +74,14 @@ const SLACK_API_BASE = process.env.SLACK_API_BASE || "https://slack.com/api";
 //                     channel, message_ts }
 //   - "urgent_done"   (✅ Done on an actionable section item): shaped like
 //                     "archive_email" minus gmail_thread_id
+//   - "snooze"        (⏰ Snooze on an actionable section item OR a brief
+//                     recommendation): shaped { id: <item id or
+//                     "snooze-<ms>">, type, text, link, due (the item's own
+//                     due date when the payload set one, else null),
+//                     clickedAt, status, channel, message_ts }
+//   - "dismiss"       (✖️ Not for me on an actionable section item OR a
+//                     brief recommendation): shaped like "snooze" minus due
+//   (📝 "View draft" clicks queue NOTHING - they open a display-only modal)
 //   - "refresh"       (🔄 Refresh brief button, on briefs and the Home tab):
 //                     shaped { id: "refresh-<ms>", type, requested_at,
 //                     channel, message_ts, status } - `id` is
@@ -444,6 +454,27 @@ function recoverRecItem(originalBlocks, actionsBlockId) {
   }
 
   return { itemId, text, link: extractRecLinks(blocks)[itemId] || null };
+}
+
+/**
+ * Maps between the two block_ids of an actionable section item's pair:
+ * `sec_item_<id>` (the section, holding the 🗑️/✅ accessory) and
+ * `sec_item_actions_<id>` (the ⏰/✖️ row beneath it) - given either one,
+ * returns the OTHER, or null when the id isn't part of such a pair. The
+ * actions prefix is checked FIRST since it starts with the section prefix.
+ *
+ * @param {string|undefined} blockId
+ * @returns {string|null}
+ */
+function secItemCompanionBlockId(blockId) {
+  if (typeof blockId !== "string") return null;
+  if (blockId.startsWith(SEC_ITEM_ACTIONS_BLOCK_ID_PREFIX)) {
+    return `${SEC_ITEM_BLOCK_ID_PREFIX}${blockId.slice(SEC_ITEM_ACTIONS_BLOCK_ID_PREFIX.length)}`;
+  }
+  if (blockId.startsWith(SEC_ITEM_BLOCK_ID_PREFIX)) {
+    return `${SEC_ITEM_ACTIONS_BLOCK_ID_PREFIX}${blockId.slice(SEC_ITEM_BLOCK_ID_PREFIX.length)}`;
+  }
+  return null;
 }
 
 /** Stable block_id prefixes of each Home triage row's pair (see home.js). */
@@ -1162,6 +1193,90 @@ async function processInteraction(payload) {
     return;
   }
 
+  // --- "⏰ Snooze" / "✖️ Not for me" (recommendation rows) -------------------
+  // Same recovery pattern as 📌 Park: the button values are static markers
+  // ({"type":"snooze","due"?} / {"type":"dismiss"}), and the item's
+  // text/link come from the sibling buttons' values / the rec_text_<id>
+  // section (see recoverRecItem). Queue a persisted "snooze" / "dismiss"
+  // entry, then rewrite the item in place - snoozed keeps its text with a
+  // "→ ⏰ snoozed" suffix (Open link re-attached as an accessory, like
+  // Park), dismissed is struck through with "→ ✖️ not for me" - and REMOVE
+  // its buttons row (handled - no further actions on it).
+  if (action.action_id === "item_snooze" || action.action_id === "item_dismiss") {
+    const isSnooze = action.action_id === "item_snooze";
+    const originalBlocks = payload.message && payload.message.blocks;
+    const item = recoverRecItem(originalBlocks, action.block_id);
+    if (!item) {
+      console.error(
+        `${action.action_id} click outside a ${REC_ACTIONS_BLOCK_ID_PREFIX}<id> block - ignoring`
+      );
+      return;
+    }
+
+    // The snooze marker value carries the item's `due` date when the
+    // /render-brief payload set one.
+    let due = null;
+    try {
+      const marker = JSON.parse(action.value);
+      if (marker && typeof marker.due === "string" && marker.due) due = marker.due;
+    } catch (err) {
+      // Static marker missing/unparseable - the entry just has no due date.
+    }
+
+    delegations.push({
+      id: `${isSnooze ? "snooze" : "dismiss"}-${Date.now()}`,
+      type: isSnooze ? "snooze" : "dismiss",
+      text: item.text,
+      link: item.link,
+      ...(isSnooze ? { due } : {}),
+      clickedAt: new Date().toISOString(),
+      status: "pending",
+      channel: (payload.channel && payload.channel.id) || null,
+      message_ts: (payload.message && payload.message.ts) || null,
+    });
+    saveDelegations();
+
+    const responseUrl = payload.response_url;
+    if (!responseUrl || !Array.isArray(originalBlocks) || originalBlocks.length === 0) {
+      return;
+    }
+
+    const targetBlockId = `${REC_TEXT_BLOCK_ID_PREFIX}${item.itemId}`;
+    const newBlocks = originalBlocks
+      .filter((block) => !(block && block.block_id === action.block_id))
+      .map((block) => {
+        if (
+          !block ||
+          block.block_id !== targetBlockId ||
+          !block.text ||
+          typeof block.text.text !== "string"
+        ) {
+          return block;
+        }
+        let newText = isSnooze
+          ? `${block.text.text}  → ⏰ snoozed`
+          : `~${block.text.text}~  → ✖️ not for me`;
+        if (newText.length > MAX_SECTION_TEXT) {
+          newText = `${newText.slice(0, MAX_SECTION_TEXT - 1)}…`;
+        }
+        const marked = { ...block, text: { ...block.text, text: newText } };
+        // The row's actions block (holding its 🔗 Open link button) was just
+        // removed - re-attach the link as a section accessory so a snoozed
+        // item keeps its Open affordance (a dismissed item doesn't need one).
+        if (isSnooze && !marked.accessory && item.link) {
+          marked.accessory = {
+            type: "button",
+            text: { type: "plain_text", text: "Open", emoji: true },
+            url: item.link,
+          };
+        }
+        return marked;
+      });
+
+    await postResponseUrlUpdate(responseUrl, newBlocks, action.action_id);
+    return;
+  }
+
   // --- Actionable section items: 🗑️ Archive / ✅ Done ----------------------
   // Section items rendered with an accessory button (see blocks.js). The
   // button value carries {id, type, gmail_thread_id?, text, link?}. Queue
@@ -1199,24 +1314,165 @@ async function processInteraction(payload) {
     }
 
     const suffix = isArchive ? " → 🗑️ queued (runs on the next sweep)" : " → ✅ done";
-    const newBlocks = originalBlocks.map((block) => {
-      if (
-        !block ||
-        block.block_id !== action.block_id ||
-        !block.text ||
-        typeof block.text.text !== "string"
-      ) {
-        return block;
-      }
-      const { accessory, ...rest } = block; // drop the clicked button
-      let newText = `~${block.text.text}~${suffix}`;
-      if (newText.length > MAX_SECTION_TEXT) {
-        newText = `${newText.slice(0, MAX_SECTION_TEXT - 1)}…`;
-      }
-      return { ...rest, text: { ...rest.text, text: newText } };
-    });
+    // The item's companion ⏰/✖️ actions row (block_id `sec_item_actions_<id>`)
+    // is removed along with the clicked accessory - the item is handled.
+    const companionBlockId = secItemCompanionBlockId(action.block_id);
+    const newBlocks = originalBlocks
+      .filter((block) => !(block && companionBlockId && block.block_id === companionBlockId))
+      .map((block) => {
+        if (
+          !block ||
+          block.block_id !== action.block_id ||
+          !block.text ||
+          typeof block.text.text !== "string"
+        ) {
+          return block;
+        }
+        const { accessory, ...rest } = block; // drop the clicked button
+        let newText = `~${block.text.text}~${suffix}`;
+        if (newText.length > MAX_SECTION_TEXT) {
+          newText = `${newText.slice(0, MAX_SECTION_TEXT - 1)}…`;
+        }
+        return { ...rest, text: { ...rest.text, text: newText } };
+      });
 
     await postResponseUrlUpdate(responseUrl, newBlocks, action.action_id);
+    return;
+  }
+
+  // --- Actionable section items: ⏰ Snooze / ✖️ Not for me -------------------
+  // Buttons in the `sec_item_actions_<id>` row under each actionable section
+  // item (see blocks.js). The value carries {id, type, due?, text, link?}.
+  // Queue the matching "snooze" / "dismiss" delegation entry, then rewrite
+  // the item's `sec_item_<id>` section via response_url - snoozed items keep
+  // their text with a "→ ⏰ snoozed" suffix, dismissed items are struck
+  // through with "→ ✖️ not for me" - and remove both the section's accessory
+  // button and the clicked actions row, so the item can't be double-queued.
+  if (action.action_id === "sec_item_snooze" || action.action_id === "sec_item_dismiss") {
+    let value;
+    try {
+      value = JSON.parse(action.value);
+    } catch (err) {
+      console.error(`${action.action_id} click carried an unparseable value - ignoring`);
+      return;
+    }
+
+    const isSnooze = action.action_id === "sec_item_snooze";
+    delegations.push({
+      id: value.id || `${isSnooze ? "snooze" : "dismiss"}-${Date.now()}`,
+      type: isSnooze ? "snooze" : "dismiss",
+      text: value.text || "",
+      link: value.link || null,
+      ...(isSnooze ? { due: value.due || null } : {}),
+      clickedAt: new Date().toISOString(),
+      status: "pending",
+      channel: (payload.channel && payload.channel.id) || null,
+      message_ts: (payload.message && payload.message.ts) || null,
+    });
+    saveDelegations();
+
+    const responseUrl = payload.response_url;
+    const originalBlocks = payload.message && payload.message.blocks;
+    if (!responseUrl || !Array.isArray(originalBlocks) || originalBlocks.length === 0) {
+      return;
+    }
+
+    // The click came from the actions row (`sec_item_actions_<id>`); the
+    // item's text lives in its sibling section (`sec_item_<id>`).
+    const sectionBlockId = secItemCompanionBlockId(action.block_id);
+    const newBlocks = originalBlocks
+      .filter((block) => !(block && block.block_id === action.block_id))
+      .map((block) => {
+        if (
+          !block ||
+          !sectionBlockId ||
+          block.block_id !== sectionBlockId ||
+          !block.text ||
+          typeof block.text.text !== "string"
+        ) {
+          return block;
+        }
+        const { accessory, ...rest } = block; // drop the 🗑️/✅ accessory too
+        let newText = isSnooze
+          ? `${block.text.text} → ⏰ snoozed`
+          : `~${block.text.text}~ → ✖️ not for me`;
+        if (newText.length > MAX_SECTION_TEXT) {
+          newText = `${newText.slice(0, MAX_SECTION_TEXT - 1)}…`;
+        }
+        return { ...rest, text: { ...rest.text, text: newText } };
+      });
+
+    await postResponseUrlUpdate(responseUrl, newBlocks, action.action_id);
+    return;
+  }
+
+  // --- "📝 View draft" ------------------------------------------------------
+  // Accessory on draft-carrying section items (e.g. the Delegated section's
+  // ready-to-send nudges) and in the ⏰/✖️ row of actionable items. Opens a
+  // modal (views.open with the interaction's trigger_id) showing the draft
+  // in a copyable code block. Display only: nothing is queued, nothing is
+  // sent, and the message is left untouched. trigger_ids expire after 3
+  // seconds, so this runs immediately after the ack; a failure is logged and
+  // swallowed like every other post-ack Slack call.
+  if (action.action_id === "sec_item_view_draft") {
+    let value;
+    try {
+      value = JSON.parse(action.value);
+    } catch (err) {
+      console.error("sec_item_view_draft click carried an unparseable value - ignoring");
+      return;
+    }
+    const draft = typeof value.draft === "string" ? value.draft : "";
+    if (!draft || !payload.trigger_id) {
+      console.error("sec_item_view_draft click had no draft/trigger_id - ignoring");
+      return;
+    }
+
+    // Escape Slack mrkdwn control chars so the draft renders verbatim inside
+    // the code block.
+    const escaped = draft.replace(/&/g, "&amp;").replace(/</g, "&lt;").replace(/>/g, "&gt;");
+
+    try {
+      const openResponse = await fetch(`${SLACK_API_BASE}/views.open`, {
+        method: "POST",
+        headers: {
+          "Content-Type": "application/json; charset=utf-8",
+          Authorization: `Bearer ${SLACK_BOT_TOKEN}`,
+        },
+        body: JSON.stringify({
+          trigger_id: payload.trigger_id,
+          view: {
+            type: "modal",
+            title: { type: "plain_text", text: "Draft", emoji: true },
+            close: { type: "plain_text", text: "Close", emoji: true },
+            blocks: [
+              {
+                type: "section",
+                text: {
+                  type: "mrkdwn",
+                  text: `\`\`\`${escaped.slice(0, MAX_SECTION_TEXT - 6)}\`\`\``,
+                },
+              },
+              {
+                type: "context",
+                elements: [
+                  {
+                    type: "mrkdwn",
+                    text: "Copy the text above - nothing is sent automatically.",
+                  },
+                ],
+              },
+            ],
+          },
+        }),
+      });
+      const openJson = await openResponse.json().catch(() => ({}));
+      if (!openJson.ok) {
+        console.error(`views.open for sec_item_view_draft failed: ${openJson.error}`);
+      }
+    } catch (err) {
+      console.error("Error opening draft modal:", err);
+    }
     return;
   }
 
@@ -1298,8 +1554,8 @@ async function processInteraction(payload) {
 // Returns every delegation-queue entry still awaiting an ack:
 // { items: [{ id, type, ..., clickedAt, status: "pending" }] } where `type`
 // is "calendar" | "task_complete" | "bot_do" | "triage_add" |
-// "archive_email" | "urgent_done" | "refresh" | "gmail_zero_start" |
-// "slack_zero_start" (see the queue comment at
+// "archive_email" | "urgent_done" | "snooze" | "dismiss" | "refresh" |
+// "gmail_zero_start" | "slack_zero_start" (see the queue comment at
 // the top of this file for per-type fields). Entries queued before the
 // `type` field existed are reported as "calendar" so consumers can always
 // distinguish. Protected by the same X-Internal-Secret header as
