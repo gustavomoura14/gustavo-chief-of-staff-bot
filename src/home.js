@@ -38,7 +38,9 @@
  *      "task_complete"), a "🤖 Do it" button (action_id "home_task_bot"), a
  *      "📌 Park for 1:1" button (action_id "home_task_park") and a
  *      "🙋 Delegate to..." users_select (action_id "home_task_delegate") —
- *      capped at MAX_TRIAGE_TASKS rows plus an "…and N more" context line
+ *      tasks may be objects or bare strings; at most MAX_TRIAGE_TASKS rows
+ *      are interactive and EVERY task past the cap still renders in a
+ *      compact "…and N more" overflow list (block_id `triage_overflow`)
  *   5b. (when `delegated` is a non-empty array) a "🙋 Delegated" section:
  *      one line per item - "🟢/🟡/🔴 <text> → <to> (<days>d)" with an inline
  *      "open" link when present - capped at MAX_DELEGATED_ITEMS items.
@@ -65,6 +67,13 @@ const BUTTON_VALUE_MAX = 2000;
 const BUTTON_URL_MAX = 3000;
 
 const TASK_SOURCE_ICONS = { slack: "💬", email: "📧", manual: "📝" };
+
+// Slack caps a Home view at 100 blocks total (views.publish rejects more).
+const MAX_HOME_BLOCKS = 100;
+
+// The triage-overflow compact list lives in one section block (3000-char cap).
+const MAX_TRIAGE_OVERFLOW_TEXT = 2990;
+const OVERFLOW_LINE_TEXT_MAX = 180;
 
 // "🙋 Delegated" section limits/icons.
 const MAX_DELEGATED_ITEMS = 15;
@@ -316,21 +325,103 @@ function buildProjectsBlocks(projects) {
 }
 
 /**
+ * Normalizes one `tasks` entry. Payload senders routinely mix task OBJECTS
+ * with bare STRINGS ("Book PA offsite travel — …"); the old object-only
+ * filter silently dropped every string entry, which is exactly how the Home
+ * tab lost most of its tasks. Strings become { id: "s<index>", text,
+ * source: "manual" }; objects get an index-derived id fallback. Returns
+ * null for anything unusable (which the caller filters out).
+ *
+ * @param {object|string} entry - a `tasks` array element
+ * @param {number} index - the entry's position (stable id fallback)
+ * @returns {{id: string|number, text: string, source?: string,
+ *            link?: string, status?: string}|null}
+ */
+function normalizeTask(entry, index) {
+  if (typeof entry === "string" && entry.trim() !== "") {
+    return { id: `s${index}`, text: entry.trim(), source: "manual" };
+  }
+  if (entry && typeof entry.text === "string" && entry.text.trim() !== "") {
+    return entry.id !== undefined && entry.id !== null ? entry : { ...entry, id: index };
+  }
+  return null;
+}
+
+/**
+ * Builds the compact overflow list for triage tasks beyond the
+ * interactive-row cap: ONE section block with an "*…and N more:*" lead-in
+ * and one icon+text line per task (hyperlinked when the task has a link).
+ * Every task renders; if the 3000-char section cap is hit, the cut is
+ * called out explicitly in a context line — never silently truncated.
+ *
+ * @param {Array<{id: string|number, text: string, source?: string,
+ *                link?: string}>} overflow - normalized tasks past the cap
+ * @returns {Array<object>}
+ */
+function buildTriageOverflowBlocks(overflow) {
+  if (overflow.length === 0) return [];
+
+  const lines = overflow.map((task) => {
+    const icon = TASK_SOURCE_ICONS[task.source] || TASK_SOURCE_ICONS.manual;
+    let text = task.text;
+    if (text.length > OVERFLOW_LINE_TEXT_MAX) {
+      text = `${text.slice(0, OVERFLOW_LINE_TEXT_MAX - 1)}…`;
+    }
+    const hasLink = typeof task.link === "string" && task.link;
+    return `${icon} ${hasLink ? `<${task.link}|${text}>` : text}`;
+  });
+
+  const headerLine = `*…and ${overflow.length} more* (rows free up as tasks above clear):`;
+  const kept = [];
+  let length = headerLine.length;
+  for (const line of lines) {
+    if (length + 1 + line.length > MAX_TRIAGE_OVERFLOW_TEXT) break;
+    kept.push(line);
+    length += 1 + line.length;
+  }
+
+  const blocks = [
+    {
+      type: "section",
+      block_id: "triage_overflow",
+      text: { type: "mrkdwn", text: [headerLine, ...kept].join("\n") },
+    },
+  ];
+  if (kept.length < lines.length) {
+    blocks.push({
+      type: "context",
+      elements: [
+        {
+          type: "mrkdwn",
+          text: `…${lines.length - kept.length} more hit Slack's block-size cap — clear some tasks above to see them.`,
+        },
+      ],
+    });
+  }
+  return blocks;
+}
+
+/**
  * Builds the "📥 Triage" board blocks: one section+actions pair per task —
  * the section is the task text (hyperlinked to task.link when present), the
  * actions row leads with a "🔗 Open" link button (when the task has a link)
  * then holds "✅ Complete", "🤖 Do it" and "📌 Park for 1:1" buttons plus a
- * "🙋 Delegate to..." users_select — capped at MAX_TRIAGE_TASKS with an
- * "…and N more" context line. Returns [] when there are no valid tasks.
+ * "🙋 Delegate to..." users_select. Entries may be task objects OR bare
+ * strings (see normalizeTask). At most `maxFullRows` interactive rows
+ * render; EVERY remaining task still renders via the compact overflow list
+ * (see buildTriageOverflowBlocks). Returns [] when there are no valid tasks.
  *
  * @param {Array<{id: string, text: string, source?: string, link?: string,
- *                status?: string}>|undefined} tasks
+ *                status?: string}|string>|undefined} tasks
+ * @param {number} [maxFullRows] - interactive-row cap (defaults to
+ *   MAX_TRIAGE_TASKS; buildHomeView lowers it when the view nears Slack's
+ *   100-block limit)
  * @returns {Array<object>}
  */
-function buildTriageBlocks(tasks) {
-  const valid = (Array.isArray(tasks) ? tasks : []).filter(
-    (task) => task && typeof task.text === "string" && task.text.trim() !== ""
-  );
+function buildTriageBlocks(tasks, maxFullRows = MAX_TRIAGE_TASKS) {
+  const valid = (Array.isArray(tasks) ? tasks : [])
+    .map(normalizeTask)
+    .filter((task) => task !== null);
   if (valid.length === 0) return [];
 
   const blocks = [
@@ -341,12 +432,12 @@ function buildTriageBlocks(tasks) {
     },
   ];
 
-  valid.slice(0, MAX_TRIAGE_TASKS).forEach((task, index) => {
+  valid.slice(0, maxFullRows).forEach((task) => {
     const icon = TASK_SOURCE_ICONS[task.source] || TASK_SOURCE_ICONS.manual;
     const doing = task.status === "doing" ? " 🔄" : "";
     const hasLink = typeof task.link === "string" && task.link;
     const text = `${icon}${doing} ${hasLink ? `<${task.link}|${task.text}>` : task.text}`;
-    const taskId = task.id !== undefined && task.id !== null ? task.id : index;
+    const taskId = task.id; // normalizeTask guarantees an id
     // Stable block_ids (`task_<id>` / `task_actions_<id>`) let
     // /slack/interactions surgically rewrite or remove this pair from
     // payload.view.blocks for instant feedback on ✅ Complete / 🤖 Do it.
@@ -405,44 +496,74 @@ function buildTriageBlocks(tasks) {
     });
   });
 
-  if (valid.length > MAX_TRIAGE_TASKS) {
-    blocks.push({
-      type: "context",
-      elements: [
-        { type: "mrkdwn", text: `…and ${valid.length - MAX_TRIAGE_TASKS} more` },
-      ],
-    });
-  }
+  blocks.push(...buildTriageOverflowBlocks(valid.slice(maxFullRows)));
 
   return blocks;
+}
+
+// Leading status emoji recognized on bare-string `delegated` entries.
+const DELEGATED_ICON_STATUS = { "🟢": "green", "🟡": "yellow", "🔴": "red" };
+
+/**
+ * Normalizes one `delegated` entry. Like `tasks`, payload senders often send
+ * bare STRINGS ("🔴 Hannah Yi — Exterro SSO…") that the old object-only
+ * filter silently dropped. A string's leading 🟢/🟡/🔴 becomes its status
+ * and the rest its text (the who is usually already in the line, so no `to`
+ * is synthesized). Objects pass through. Returns null for anything unusable.
+ *
+ * @param {object|string} entry - a `delegated` array element
+ * @returns {{text: string, to?: string, status?: string, link?: string,
+ *            days?: number}|null}
+ */
+function normalizeDelegated(entry) {
+  if (typeof entry === "string" && entry.trim() !== "") {
+    let text = entry.trim();
+    let status;
+    for (const [icon, name] of Object.entries(DELEGATED_ICON_STATUS)) {
+      if (text.startsWith(icon)) {
+        status = name;
+        text = text.slice(icon.length).trim();
+        break;
+      }
+    }
+    return text ? { text, status } : null;
+  }
+  if (entry && typeof entry.text === "string" && entry.text.trim() !== "") {
+    return entry;
+  }
+  return null;
 }
 
 /**
  * Builds the "🙋 Delegated" section blocks: divider + header + ONE section
  * block with one line per item — "🟢/🟡/🔴 <text> → <to> (<days>d)" with an
  * inline "open" link when present — capped at MAX_DELEGATED_ITEMS with an
- * "…and N more" context line. `to` values that look like Slack user IDs
- * (U…/W…) render as <@id> mentions; anything else renders verbatim. Returns
- * [] when there are no valid items, so a missing/empty `delegated` payload
- * field omits the section entirely.
+ * "…and N more" context line. Entries may be objects OR bare strings (see
+ * normalizeDelegated). `to` values that look like Slack user IDs (U…/W…)
+ * render as <@id> mentions; anything else renders verbatim; a missing `to`
+ * simply omits the arrow. Returns [] when there are no valid items, so a
+ * missing/empty `delegated` payload field omits the section entirely.
  *
  * @param {Array<{text: string, to?: string, status?: "green"|"yellow"|"red",
- *                link?: string, days?: number}>|undefined} delegated
+ *                link?: string, days?: number}|string>|undefined} delegated
  * @returns {Array<object>}
  */
 function buildDelegatedBlocks(delegated) {
-  const valid = (Array.isArray(delegated) ? delegated : []).filter(
-    (item) => item && typeof item.text === "string" && item.text.trim() !== ""
-  );
+  const valid = (Array.isArray(delegated) ? delegated : [])
+    .map(normalizeDelegated)
+    .filter((item) => item !== null);
   if (valid.length === 0) return [];
 
   const lines = valid.slice(0, MAX_DELEGATED_ITEMS).map((item) => {
     const icon = DELEGATED_STATUS_ICONS[item.status] || "⚪";
-    let to = typeof item.to === "string" && item.to.trim() !== "" ? item.to.trim() : "?";
-    if (/^[UW][A-Z0-9]{4,}$/.test(to)) {
-      to = `<@${to}>`;
+    let line = `${icon} ${item.text}`;
+    let to = typeof item.to === "string" && item.to.trim() !== "" ? item.to.trim() : null;
+    if (to) {
+      if (/^[UW][A-Z0-9]{4,}$/.test(to)) {
+        to = `<@${to}>`;
+      }
+      line += ` → ${to}`;
     }
-    let line = `${icon} ${item.text} → ${to}`;
     if (isNum(item.days)) {
       line += ` (${item.days}d)`;
     }
@@ -485,9 +606,13 @@ function buildDelegatedBlocks(delegated) {
  * Builds the App Home view for views.publish.
  *
  * @param {object} payload - the /update-home request body (see README)
+ * @param {Array<object>} [extraBlocks] - pre-built blocks for the
+ *   config-gated extra sections (Gmail cleanup / Slack needs-you / Calendar
+ *   quick actions — see home_extras.js), inserted after 🙋 Delegated and
+ *   before the notes
  * @returns {{type: "home", blocks: Array<object>}}
  */
-function buildHomeView(payload) {
+function buildHomeView(payload, extraBlocks = []) {
   const {
     date_label,
     meeting_hours_today,
@@ -504,110 +629,126 @@ function buildHomeView(payload) {
     delegated,
   } = payload || {};
 
-  const blocks = [];
+  const assemble = (triageRowCap) => {
+    const blocks = [];
 
-  blocks.push({
-    type: "header",
-    text: {
-      type: "plain_text",
-      text: `📊 Bandwidth — ${date_label || "today"}`,
-      emoji: true,
-    },
-  });
-
-  // --- Voice-briefing / refresh buttons -------------------------------------
-  // One actions block near the top: "🎙️ Hear it" (action_id `voice_open`,
-  // handled client-side by Slack via its `url`) plus "🔄 Refresh brief"
-  // (action_id `brief_refresh`, queues a "refresh" delegation entry). Both
-  // buttons share the block, so this still costs a single block and the view
-  // stays comfortably under Slack's 100-block Home cap (worst case here is
-  // well below it: header + buttons + meter + fields + burn-down + 20 triage
-  // rows + notes + footer).
-  blocks.push(buildVoiceButtonBlock());
-
-  // --- Today's meeting-load meter -----------------------------------------
-  const meter = computeMeter(meeting_hours_today, focus_hours_today);
-  if (meter) {
     blocks.push({
-      type: "section",
+      type: "header",
       text: {
-        type: "mrkdwn",
-        text: `\`${meter.bar}\` *${meter.percent}%* meeting load\n${meter.emoji} ${meter.label}`,
+        type: "plain_text",
+        text: `📊 Bandwidth — ${date_label || "today"}`,
+        emoji: true,
       },
     });
-  }
 
-  // --- Stats fields (only fields actually present) ------------------------
-  const fields = [];
-  if (isNum(meeting_hours_today)) {
-    fields.push(`*Meetings today:*\n${hours(meeting_hours_today)}`);
-  }
-  if (isNum(focus_hours_today)) {
-    fields.push(`*Open focus time:*\n${hours(focus_hours_today)}`);
-  }
-  if (isNum(meetings_this_week) || isNum(meeting_hours_week)) {
-    const count = isNum(meetings_this_week) ? `${meetings_this_week}` : null;
-    const hrs = isNum(meeting_hours_week) ? hours(meeting_hours_week) : null;
-    const value = count && hrs ? `${count} (${hrs})` : count || hrs;
-    fields.push(`*Meetings this week:*\n${value}`);
-  }
-  if (isNum(pending_items)) {
-    fields.push(`*Pending items:*\n${pending_items}`);
-  }
-  if (isNum(new_today)) {
-    fields.push(`*New today:*\n${new_today}`);
-  }
-  if (typeof on_call === "boolean") {
-    fields.push(`*On call:*\n${on_call ? "🔴 yes" : "—"}`);
-  }
+    // --- Voice-briefing / refresh buttons -----------------------------------
+    // One actions block near the top: "🎙️ Hear it" (action_id `voice_open`,
+    // handled client-side by Slack via its `url`) plus "🔄 Refresh brief"
+    // (action_id `brief_refresh`, queues a "refresh" delegation entry). Both
+    // buttons share the block, so this still costs a single block.
+    blocks.push(buildVoiceButtonBlock());
 
-  if (fields.length > 0) {
-    blocks.push({ type: "divider" });
-    blocks.push({
-      type: "section",
-      fields: fields.map((text) => ({ type: "mrkdwn", text })),
-    });
-  }
-
-  // --- Zero missions / burn-down bar (above triage) -------------------------
-  // `projects` replaces the burn-down meter; when both are present, projects
-  // wins. Payloads without `projects` render the old burn-down unchanged.
-  if (projects && typeof projects === "object") {
-    blocks.push(...buildProjectsBlocks(projects));
-  } else {
-    blocks.push(...buildBurndownBlocks(burndown));
-  }
-
-  // --- Triage board ----------------------------------------------------------
-  blocks.push(...buildTriageBlocks(tasks));
-
-  // --- Delegated items (after the triage board) ------------------------------
-  blocks.push(...buildDelegatedBlocks(delegated));
-
-  // --- Notes ---------------------------------------------------------------
-  const noteLines = Array.isArray(notes)
-    ? notes.filter((line) => typeof line === "string" && line.trim() !== "")
-    : [];
-  if (noteLines.length > 0) {
-    blocks.push({ type: "divider" });
-    noteLines.forEach((line) => {
+    // --- Today's meeting-load meter ------------------------------------------
+    const meter = computeMeter(meeting_hours_today, focus_hours_today);
+    if (meter) {
       blocks.push({
-        type: "context",
-        elements: [{ type: "mrkdwn", text: `📌 ${line}` }],
+        type: "section",
+        text: {
+          type: "mrkdwn",
+          text: `\`${meter.bar}\` *${meter.percent}%* meeting load\n${meter.emoji} ${meter.label}`,
+        },
       });
-    });
-  }
+    }
 
-  // --- Footer --------------------------------------------------------------
-  blocks.push({
-    type: "context",
-    elements: [
-      {
-        type: "mrkdwn",
-        text: `Updated ${new Date().toISOString()} · refreshed by the morning brief and EOD close-out.`,
-      },
-    ],
-  });
+    // --- Stats fields (only fields actually present) -------------------------
+    const fields = [];
+    if (isNum(meeting_hours_today)) {
+      fields.push(`*Meetings today:*\n${hours(meeting_hours_today)}`);
+    }
+    if (isNum(focus_hours_today)) {
+      fields.push(`*Open focus time:*\n${hours(focus_hours_today)}`);
+    }
+    if (isNum(meetings_this_week) || isNum(meeting_hours_week)) {
+      const count = isNum(meetings_this_week) ? `${meetings_this_week}` : null;
+      const hrs = isNum(meeting_hours_week) ? hours(meeting_hours_week) : null;
+      const value = count && hrs ? `${count} (${hrs})` : count || hrs;
+      fields.push(`*Meetings this week:*\n${value}`);
+    }
+    if (isNum(pending_items)) {
+      fields.push(`*Pending items:*\n${pending_items}`);
+    }
+    if (isNum(new_today)) {
+      fields.push(`*New today:*\n${new_today}`);
+    }
+    if (typeof on_call === "boolean") {
+      fields.push(`*On call:*\n${on_call ? "🔴 yes" : "—"}`);
+    }
+
+    if (fields.length > 0) {
+      blocks.push({ type: "divider" });
+      blocks.push({
+        type: "section",
+        fields: fields.map((text) => ({ type: "mrkdwn", text })),
+      });
+    }
+
+    // --- Zero missions / burn-down bar (above triage) -------------------------
+    // `projects` replaces the burn-down meter; when both are present, projects
+    // wins. Payloads without `projects` render the old burn-down unchanged.
+    if (projects && typeof projects === "object") {
+      blocks.push(...buildProjectsBlocks(projects));
+    } else {
+      blocks.push(...buildBurndownBlocks(burndown));
+    }
+
+    // --- Triage board ----------------------------------------------------------
+    blocks.push(...buildTriageBlocks(tasks, triageRowCap));
+
+    // --- Delegated items (after the triage board) ------------------------------
+    blocks.push(...buildDelegatedBlocks(delegated));
+
+    // --- Extra sections (Gmail cleanup / Slack needs-you / Calendar) -----------
+    if (Array.isArray(extraBlocks) && extraBlocks.length > 0) {
+      blocks.push(...extraBlocks);
+    }
+
+    // --- Notes ---------------------------------------------------------------
+    const noteLines = Array.isArray(notes)
+      ? notes.filter((line) => typeof line === "string" && line.trim() !== "")
+      : [];
+    if (noteLines.length > 0) {
+      blocks.push({ type: "divider" });
+      noteLines.forEach((line) => {
+        blocks.push({
+          type: "context",
+          elements: [{ type: "mrkdwn", text: `📌 ${line}` }],
+        });
+      });
+    }
+
+    // --- Footer --------------------------------------------------------------
+    blocks.push({
+      type: "context",
+      elements: [
+        {
+          type: "mrkdwn",
+          text: `Updated ${new Date().toISOString()} · refreshed by the morning brief and EOD close-out.`,
+        },
+      ],
+    });
+
+    return blocks;
+  };
+
+  // Slack rejects Home views over 100 blocks outright. Full triage rows cost
+  // 2 blocks each, so when the assembled view is over the cap, re-assemble
+  // with fewer interactive rows — the surplus tasks still render as compact
+  // overflow lines, so nothing is ever silently dropped.
+  let blocks = assemble(MAX_TRIAGE_TASKS);
+  for (const cap of [12, 8, 4, 0]) {
+    if (blocks.length <= MAX_HOME_BLOCKS) break;
+    blocks = assemble(cap);
+  }
 
   return { type: "home", blocks };
 }

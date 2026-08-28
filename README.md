@@ -203,6 +203,10 @@ best-effort re-publishes the Home view with the row marked
 ]
 ```
 
+Entries may also be **bare strings** (`"Book PA offsite travel"`), which are
+normalized to `{ id: "s<index>", text, source: "manual" }` — the same is
+true of `delegated` entries, whose leading 🟢/🟡/🔴 becomes the status.
+
 | Field | Type | Meaning |
 | --- | --- | --- |
 | `id` | string, required | Stable task id (echoed back on completion). |
@@ -218,9 +222,10 @@ present) plus a buttons row with **✅ Complete** (`action_id:
 "task_complete"`, whose `value` carries `{taskId, text, source, link}`) and
 **🤖 Do it** (`action_id: "home_task_bot"`, whose `value` carries
 `{id, text (≤140 chars), link?, source?}`) — both values stay under Slack's
-2000-char button-value cap. At most **20 tasks** are rendered (two blocks
-each, keeping the Home view safely under Slack's 100-block limit); extras
-collapse into an "…and N more" context line.
+2000-char button-value cap. At most **20 tasks** get interactive rows (two
+blocks each; the cap shrinks automatically when the whole view would exceed
+Slack's 100-block limit); **every task past the cap still renders** in a
+compact "…and N more" list — nothing is silently truncated.
 
 Clicking **✅ Complete** pushes a `task_complete` entry onto the delegation
 queue (see `/delegations/pending`) and best-effort re-publishes the Home
