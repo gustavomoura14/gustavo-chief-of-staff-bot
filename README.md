@@ -439,6 +439,14 @@ the queue.
 | `DATA_DIR` | *Optional.* Directory for the persisted delegation queue file (`delegations.json`); defaults to the OS temp dir. Point it at a persistent disk for maximum durability. |
 | `SLACK_API_BASE` | *Optional, tests only.* Overrides the Slack Web API base URL (`https://slack.com/api`) so local tests can target a mock server. Leave unset in production. |
 
+Optional Home-tab feature vars — `GMAIL_CLIENT_ID` / `GMAIL_CLIENT_SECRET` /
+`GMAIL_REFRESH_TOKEN` (📧 Gmail cleanup section, archive-only) and
+`SLACK_USER_TOKEN` (💬 read-only "Slack needs you" section) — are documented
+in [SETUP.md](SETUP.md); with them unset the sections render a short
+"not connected" note and nothing else changes. The 📅 Calendar quick-action
+buttons need no config: they queue `calendar_block` / `calendar_move`
+delegation entries for the hourly sweep.
+
 See `.env.example`.
 
 ## Running locally
