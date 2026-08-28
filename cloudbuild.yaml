@@ -1,0 +1,65 @@
+# Cloud Build pipeline: build the image into Artifact Registry, then deploy
+# it to Cloud Run. Run from the repo root with:
+#
+#   gcloud builds submit --project rvt-cos-bot-prod-01 \
+#     --config cloudbuild.yaml \
+#     --substitutions SHORT_SHA=$(git rev-parse --short HEAD)
+#
+# (SHORT_SHA is auto-populated when this runs from a Cloud Build git trigger;
+# the --substitutions flag is only needed for manual `gcloud builds submit`
+# runs, which have no git context.)
+#
+# One-time prerequisites (exact commands in MIGRATION.md):
+#   - Artifact Registry repo "cos-bot" in us-central1
+#   - Secret Manager secrets: SLACK_SIGNING_SECRET, SLACK_BOT_TOKEN,
+#     INTERNAL_API_SECRET (these are the env var names src/server.js reads;
+#     Cloud Run injects each secret's latest version as that env var)
+#   - Firestore database (native mode)
+#   - The default compute service account needs roles/datastore.user (to use
+#     Firestore) and roles/secretmanager.secretAccessor (to mount secrets).
+substitutions:
+  _REGION: us-central1
+  _REPO: cos-bot
+  _SERVICE: gustavo-chief-of-staff-bot
+  _IMAGE: ${_REGION}-docker.pkg.dev/${PROJECT_ID}/${_REPO}/${_SERVICE}
+
+steps:
+  - id: build
+    name: gcr.io/cloud-builders/docker
+    args:
+      - build
+      - --tag=${_IMAGE}:${SHORT_SHA}
+      - --tag=${_IMAGE}:latest
+      - .
+
+  - id: push
+    name: gcr.io/cloud-builders/docker
+    args: [push, --all-tags, "${_IMAGE}"]
+
+  - id: deploy
+    name: gcr.io/google.com/cloudsdktool/cloud-sdk:slim
+    entrypoint: gcloud
+    args:
+      - run
+      - deploy
+      - ${_SERVICE}
+      - --image=${_IMAGE}:${SHORT_SHA}
+      - --region=${_REGION}
+      - --platform=managed
+      # Slack posts interaction payloads with no Google identity token, so
+      # the endpoint must be public; request auth is the Slack signature
+      # check (/slack/interactions) + X-Internal-Secret (internal routes).
+      - --allow-unauthenticated
+      # Keep one instance warm: Slack's 3-second interactivity deadline
+      # leaves no room for cold starts (this replaces Render's keep-warm
+      # pinger; KEEP_WARM=off below disables the in-process self-ping, which
+      # would otherwise ping the old Render URL).
+      - --min-instances=1
+      # STORAGE_BACKEND=firestore turns on the Firestore delegation-queue
+      # backend (src/storage.js); GIT_COMMIT surfaces in GET /healthz.
+      - --set-env-vars=STORAGE_BACKEND=firestore,KEEP_WARM=off,GIT_COMMIT=${SHORT_SHA}
+      - --set-secrets=SLACK_SIGNING_SECRET=SLACK_SIGNING_SECRET:latest,SLACK_BOT_TOKEN=SLACK_BOT_TOKEN:latest,INTERNAL_API_SECRET=INTERNAL_API_SECRET:latest
+
+images:
+  - ${_IMAGE}:${SHORT_SHA}
+  - ${_IMAGE}:latest
