@@ -1,9 +1,6 @@
 "use strict";
 
 const crypto = require("crypto");
-const fs = require("fs");
-const os = require("os");
-const path = require("path");
 const express = require("express");
 const {
   buildBriefBlocks,
@@ -17,6 +14,7 @@ const {
 } = require("./blocks");
 const { verifySlackSignature } = require("./verify");
 const { buildHomeView } = require("./home");
+const { createStore } = require("./storage");
 
 const app = express();
 const PORT = process.env.PORT || 3000;
@@ -34,12 +32,17 @@ const SLACK_API_BASE = process.env.SLACK_API_BASE || "https://slack.com/api";
 // via GET /delegations/pending and marks entries via POST /delegations/ack
 // or POST /delegations/complete.
 //
-// Durability: the queue is held in memory AND mirrored to a JSON file
-// (DATA_DIR env var, defaulting to the OS temp dir) on every mutation (push,
-// ack, complete). On startup the file, if present, is loaded back - so plain
-// process restarts/crashes no longer drop queued clicks. Residual risk: a
-// full instance re-provision (e.g. Render free tier moving the service to a
-// fresh filesystem) still loses the file - see README.
+// Durability: the queue is held in memory AND mirrored through a storage
+// backend (src/storage.js) on every mutation (push, ack, complete). On
+// startup the persisted queue, if present, is loaded back - so plain process
+// restarts/crashes no longer drop queued clicks. Backend selection is
+// STORAGE_BACKEND:
+//   - unset or "file": the original JSON-file mirror (DATA_DIR env var,
+//     defaulting to the OS temp dir). Residual risk: a full instance
+//     re-provision (e.g. Render free tier moving the service to a fresh
+//     filesystem) still loses the file - see README.
+//   - "firestore": Google Cloud Firestore (used on Cloud Run), which
+//     survives re-provisions and redeploys.
 //
 // Every entry has { id, type, clickedAt, status } where status is
 // "pending" | "done" | "failed" (acks may also attach `note`/`ackedAt`) and
@@ -92,37 +95,48 @@ const SLACK_API_BASE = process.env.SLACK_API_BASE || "https://slack.com/api";
 //                     message). An external sweep drains these and re-renders
 //                     the brief.
 // ---------------------------------------------------------------------------
-const DATA_DIR = process.env.DATA_DIR || os.tmpdir();
-const DELEGATIONS_FILE = path.join(DATA_DIR, "delegations.json");
+const store = createStore();
 
 const delegations = [];
-try {
-  if (fs.existsSync(DELEGATIONS_FILE)) {
-    const loaded = JSON.parse(fs.readFileSync(DELEGATIONS_FILE, "utf8"));
-    if (Array.isArray(loaded)) {
-      delegations.push(...loaded);
-      console.log(`Loaded ${loaded.length} delegation entries from ${DELEGATIONS_FILE}`);
-    }
-  }
-} catch (err) {
-  console.error(`Failed to load delegation queue from ${DELEGATIONS_FILE}:`, err);
-}
 
 /**
- * Persists the delegation queue to DELEGATIONS_FILE (write-to-temp +
- * rename, so a crash mid-write never truncates the previous good file).
- * Best-effort: persistence failures are logged, never thrown - the in-memory
- * queue keeps working exactly as before.
+ * Seeds the in-memory queue from the storage backend. Called once before the
+ * server starts listening (see the bottom of this file), so no request can
+ * observe - or overwrite - a not-yet-loaded queue. Best-effort: a load
+ * failure is logged and the server starts with an empty queue, exactly like
+ * the original file loader.
+ */
+async function loadDelegations() {
+  try {
+    const loaded = await store.load();
+    if (Array.isArray(loaded) && loaded.length > 0) {
+      delegations.push(...loaded);
+      console.log(`Loaded ${loaded.length} delegation entries from ${store.description}`);
+    }
+  } catch (err) {
+    console.error(`Failed to load delegation queue from ${store.description}:`, err);
+  }
+}
+
+// Saves are serialized through this promise chain so a slow backend (e.g.
+// Firestore) can never apply an older snapshot of the queue after a newer
+// one.
+let saveChain = Promise.resolve();
+
+/**
+ * Persists the delegation queue through the storage backend (the file
+ * backend keeps the original write-to-temp + rename, so a crash mid-write
+ * never truncates the previous good file). Best-effort: persistence failures
+ * are logged, never thrown - the in-memory queue keeps working exactly as
+ * before.
  */
 function saveDelegations() {
-  try {
-    fs.mkdirSync(DATA_DIR, { recursive: true });
-    const tmpFile = `${DELEGATIONS_FILE}.tmp`;
-    fs.writeFileSync(tmpFile, JSON.stringify(delegations));
-    fs.renameSync(tmpFile, DELEGATIONS_FILE);
-  } catch (err) {
-    console.error(`Failed to persist delegation queue to ${DELEGATIONS_FILE}:`, err);
-  }
+  const snapshot = delegations.map((entry) => ({ ...entry }));
+  saveChain = saveChain
+    .then(() => store.save(snapshot))
+    .catch((err) => {
+      console.error(`Failed to persist delegation queue to ${store.description}:`, err);
+    });
 }
 
 // Workspace host used to build permalinks for "Add to Triage" shortcut
@@ -155,11 +169,14 @@ function requireInternalSecret(req, res, next) {
 // (see README) so /slack/interactions stays responsive on free-tier hosting.
 // Reports the running build's short git SHA so deploys can be verified from
 // the outside. Computed ONCE at startup: Render exposes the deployed commit
-// as RENDER_GIT_COMMIT; local checkouts fall back to `git rev-parse`.
+// as RENDER_GIT_COMMIT; Cloud Run deploys pass GIT_COMMIT (set from
+// cloudbuild.yaml's $SHORT_SHA); local checkouts fall back to
+// `git rev-parse`.
 // ---------------------------------------------------------------------------
 const BUILD_VERSION = (() => {
-  if (typeof process.env.RENDER_GIT_COMMIT === "string" && process.env.RENDER_GIT_COMMIT) {
-    return process.env.RENDER_GIT_COMMIT.slice(0, 7);
+  const envSha = process.env.RENDER_GIT_COMMIT || process.env.GIT_COMMIT;
+  if (typeof envSha === "string" && envSha) {
+    return envSha.slice(0, 7);
   }
   try {
     const sha = require("child_process")
@@ -1774,8 +1791,15 @@ app.post("/delegations/complete", requireInternalSecret, express.json(), async (
   }
 });
 
-app.listen(PORT, () => {
-  console.log(`Chief of Staff bot listening on port ${PORT}`);
+// Load the persisted queue BEFORE accepting traffic, so an early request can
+// neither observe an empty queue nor trigger a save that overwrites the
+// persisted one. (The file backend loads in microseconds; Firestore in a few
+// hundred ms - Cloud Run only routes requests once the port is open, so this
+// also gates its startup probe correctly.)
+loadDelegations().then(() => {
+  app.listen(PORT, () => {
+    console.log(`Chief of Staff bot listening on port ${PORT} (storage: ${store.description})`);
+  });
 });
 
 // ---------------------------------------------------------------------------
