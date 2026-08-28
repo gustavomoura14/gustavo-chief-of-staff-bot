@@ -17,6 +17,7 @@ const {
 } = require("./blocks");
 const { verifySlackSignature } = require("./verify");
 const { buildHomeView } = require("./home");
+const { gatherHomeExtras, buildExtrasBlocks, handleExtraAction } = require("./home_extras");
 
 const app = express();
 const PORT = process.env.PORT || 3000;
@@ -81,6 +82,12 @@ const SLACK_API_BASE = process.env.SLACK_API_BASE || "https://slack.com/api";
 //                     clickedAt, status, channel, message_ts }
 //   - "dismiss"       (✖️ Not for me on an actionable section item OR a
 //                     brief recommendation): shaped like "snooze" minus due
+//   - "calendar_block" (📅 Home-tab Calendar quick actions): shaped
+//                     { id: "calblock-<ms>", type, duration_minutes, day
+//                     ("today"|"tomorrow"), when ("now"|null), title,
+//                     clickedAt, status }
+//   - "calendar_move" (📅 "Flag a meeting to move"): shaped
+//                     { id: "calmove-<ms>", type, clickedAt, status }
 //   (📝 "View draft" clicks queue NOTHING - they open a display-only modal)
 //   - "refresh"       (🔄 Refresh brief button, on briefs and the Home tab):
 //                     shaped { id: "refresh-<ms>", type, requested_at,
@@ -266,7 +273,12 @@ app.post("/update-home", requireInternalSecret, express.json({ limit: RENDER_BOD
     });
   }
 
-  const view = buildHomeView(body);
+  // Config-gated extra sections (📧 Gmail cleanup / 💬 Slack needs-you /
+  // 📅 Calendar quick actions - see home_extras.js). Unconfigured features
+  // resolve instantly to "not connected" notes; failures never block the
+  // publish.
+  const extras = await gatherHomeExtras();
+  const view = buildHomeView(body, buildExtrasBlocks(extras));
 
   try {
     const slackResponse = await fetch(`${SLACK_API_BASE}/views.publish`, {
@@ -689,6 +701,16 @@ async function processInteraction(payload) {
   const action = payload && payload.actions && payload.actions[0];
   if (!action) {
     console.error("Interaction payload carried no actions - nothing to do");
+    return;
+  }
+
+  // --- Home-tab extras: 📅 Calendar buttons + 📧 Gmail archive --------------
+  // New-section buttons live in home_extras.js: calendar clicks queue
+  // "calendar_block" / "calendar_move" delegation entries (drained by the
+  // hourly sweep like every other type), the Gmail archive runs inline, and
+  // both best-effort re-publish the Home view. Returns false for every other
+  // action_id, leaving all handling below untouched.
+  if (await handleExtraAction(action, payload, { delegations, saveDelegations, republishHomeView })) {
     return;
   }
 
@@ -1555,7 +1577,8 @@ async function processInteraction(payload) {
 // { items: [{ id, type, ..., clickedAt, status: "pending" }] } where `type`
 // is "calendar" | "task_complete" | "bot_do" | "triage_add" |
 // "archive_email" | "urgent_done" | "snooze" | "dismiss" | "refresh" |
-// "gmail_zero_start" | "slack_zero_start" (see the queue comment at
+// "gmail_zero_start" | "slack_zero_start" | "calendar_block" |
+// "calendar_move" (see the queue comment at
 // the top of this file for per-type fields). Entries queued before the
 // `type` field existed are reported as "calendar" so consumers can always
 // distinguish. Protected by the same X-Internal-Secret header as
