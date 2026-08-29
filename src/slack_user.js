@@ -8,9 +8,18 @@
  *
  * Uses an OPTIONAL user-authorized token (SLACK_USER_TOKEN, xoxp-…) that
  * Gustavo installs himself with minimal read scopes — `search:read`,
- * `im:read`, `im:history` (steps in SETUP.md). Without it the section
- * renders a "not configured" note and no Slack call is made; the bot runs
- * exactly as before.
+ * `im:read`, `im:history`, plus `channels:history` + `groups:history` for
+ * thread-following (steps in SETUP.md). Without it the section renders a
+ * "not configured" note and no Slack call is made; the bot runs exactly as
+ * before.
+ *
+ * THREAD-FOLLOWING: besides mentions and unread DMs, the scan surfaces
+ * replies in threads Gustavo participates in even when they don't @-mention
+ * him — his recent messages (search.messages `from:<@me>`) yield candidate
+ * (channel, thread_ts) pairs, conversations.replies fetches what landed
+ * after his last word in each, and only threads where someone else replied
+ * and he hasn't answered pass the filter. Items are deduped against the
+ * mention/DM lists and ranked by the same tier pipeline.
  *
  * HONEST LIMITATION: Slack's Web API has no bulk mark-as-read / bulk-clean
  * for a user's inbox (conversations.mark is per-channel and gated, and
@@ -27,10 +36,18 @@ const DM_SCAN_LIMIT = Math.min(200, Math.max(1, Number(process.env.SLACK_DM_SCAN
 const SHOWN_LIMIT = 5;
 const INFO_CONCURRENCY = 5;
 
-// Only mentions from the last N days count as "needs you".
+// Only mentions from the last N days count as "needs you". Thread-following
+// reuses the same window for "his recent messages".
 const MENTION_WINDOW_DAYS = 3;
 
 const MENTION_TEXT_MAX = 90;
+
+// Thread-following limits: how many unique threads one pass follows (each
+// costs one conversations.replies call), how many of his own recent messages
+// seed the candidate list, and how many replies per thread are inspected.
+const THREAD_SCAN_LIMIT = Math.min(50, Math.max(1, Number(process.env.SLACK_THREAD_SCAN_LIMIT) || 20));
+const THREAD_SEED_COUNT = 50;
+const THREAD_REPLIES_LIMIT = 50;
 
 // ---------------------------------------------------------------------------
 // Ranking. Surfaced items are ordered leadership-first (name fragments from
@@ -73,6 +90,52 @@ function byTierThenNewest(a, b) {
   return a.tier - b.tier || (Number(b.ts) || 0) - (Number(a.ts) || 0);
 }
 
+// ---------------------------------------------------------------------------
+// Thread-following helpers (pure — no Slack calls, unit-testable as-is).
+// ---------------------------------------------------------------------------
+
+/**
+ * Extracts the thread_ts from a Slack message permalink (replies carry
+ * `?thread_ts=…` in their permalink; top-level messages don't). Returns the
+ * ts string or null.
+ */
+function parseThreadTs(permalink) {
+  const match = /[?&]thread_ts=(\d+\.\d+)/.exec(String(permalink || ""));
+  return match ? match[1] : null;
+}
+
+/**
+ * True when `text` names the user in plain words ("gustavo can you…")
+ * WITHOUT a real <@U…> tag — the case the mention search can't see.
+ * `nameFragments` are lowercase fragments (handle, first name).
+ */
+function mentionsNameWithoutTag(text, nameFragments) {
+  // Strip real <@U…> tags first so only plain-word name uses count.
+  const lower = String(text || "").replace(/<@[^>]*>/g, " ").toLowerCase();
+  return (nameFragments || []).some((fragment) => fragment && lower.includes(fragment));
+}
+
+/**
+ * Strong filter + tiering for one followed thread. `thread` is
+ * { from, text, ts, repliesAfterUser } where from/text/ts describe the
+ * NEWEST reply after the user's last message. Returns null when the thread
+ * shouldn't be surfaced, else {tier, why} feeding the same ranking pipeline
+ * as mentions (leadership 0, direct question / plain name-ping 1, else 2).
+ */
+function classifyThreadReply(thread, nameFragments) {
+  if (!thread || !(thread.repliesAfterUser > 0)) return null; // he had the last word
+  if (isLeadershipName(thread.from)) {
+    return { tier: 0, why: `reply in your thread from ${thread.from} — leadership, unanswered` };
+  }
+  if (DIRECT_QUESTION_RE.test(thread.text || "")) {
+    return { tier: 1, why: `reply in your thread from ${thread.from} — question, unanswered` };
+  }
+  if (mentionsNameWithoutTag(thread.text, nameFragments)) {
+    return { tier: 1, why: `reply in your thread from ${thread.from} — names you, unanswered` };
+  }
+  return { tier: 2, why: `reply in your thread from ${thread.from}, unanswered` };
+}
+
 /** True when the optional user token is set. */
 function isConfigured() {
   return Boolean(process.env.SLACK_USER_TOKEN);
@@ -92,13 +155,131 @@ async function slackUserGet(method, params) {
 }
 
 /**
+ * Thread-following: finds threads the user participates in with unanswered
+ * replies from others. His own recent messages (search.messages
+ * `from:<@me>`, last MENTION_WINDOW_DAYS days) seed unique
+ * (channel, thread_ts) candidates — thread_ts parsed from the reply
+ * permalink, else the message itself as a possible thread root — capped at
+ * THREAD_SCAN_LIMIT. conversations.replies (needs channels:history /
+ * groups:history on the user token) then yields what landed after his last
+ * message; classifyThreadReply() keeps only unanswered threads and tiers
+ * them for the shared ranking pipeline. Items whose newest reply is already
+ * a surfaced mention (skipTs) or that live in a surfaced unread DM
+ * (skipChannels) are deduped away. Per-thread failures (for example a
+ * missing history scope) are logged and skipped; only the seed search can
+ * throw.
+ *
+ * @param {string} userId - the token owner's user id (auth.test)
+ * @param {string} teamUrl - workspace base URL with trailing slash
+ * @param {Array<string>} nameFragments - lowercase name fragments for
+ *   plain-word "names you" detection
+ * @param {Set<string>} skipTs - ts values already surfaced as mentions
+ * @param {Set<string>} skipChannels - channel ids already surfaced as DMs
+ * @returns {Promise<Array<object>>} ranked thread items (top SHOWN_LIMIT)
+ */
+async function getThreadItems(userId, teamUrl, nameFragments, skipTs, skipChannels) {
+  const search = await slackUserGet("search.messages", {
+    query: `from:<@${userId}>`,
+    sort: "timestamp",
+    sort_dir: "desc",
+    count: String(THREAD_SEED_COUNT),
+  });
+  const cutoff = (Date.now() - MENTION_WINDOW_DAYS * 24 * 60 * 60 * 1000) / 1000;
+
+  const candidates = [];
+  const seenThreads = new Set();
+  for (const m of ((search.messages || {}).matches) || []) {
+    if (!m || Number(m.ts) < cutoff) continue;
+    const channelId = m.channel && m.channel.id;
+    if (!channelId) continue;
+    const threadTs = parseThreadTs(m.permalink) || m.ts; // reply, or possible root
+    const key = `${channelId}:${threadTs}`;
+    if (seenThreads.has(key)) continue;
+    seenThreads.add(key);
+    candidates.push({
+      channelId,
+      threadTs,
+      seedTs: m.ts,
+      channelName: (m.channel && m.channel.name) || null,
+    });
+    if (candidates.length >= THREAD_SCAN_LIMIT) break;
+  }
+
+  const items = [];
+  const nameCache = new Map();
+  for (let i = 0; i < candidates.length; i += INFO_CONCURRENCY) {
+    const batch = await Promise.all(
+      candidates.slice(i, i + INFO_CONCURRENCY).map((candidate) =>
+        slackUserGet("conversations.replies", {
+          channel: candidate.channelId,
+          ts: candidate.threadTs,
+          limit: String(THREAD_REPLIES_LIMIT),
+        })
+          .then((json) => ({ candidate, messages: json.messages || [] }))
+          .catch((err) => {
+            console.error(`conversations.replies ${candidate.channelId}/${candidate.threadTs} failed:`, err);
+            return null;
+          })
+      )
+    );
+    for (const result of batch) {
+      if (!result || result.messages.length < 2) continue; // not a thread
+      const { candidate, messages } = result;
+      if (skipChannels.has(candidate.channelId)) continue; // already an unread DM
+
+      // Replies newer than his LAST message in the thread, from other humans.
+      let hisLastTs = Number(candidate.seedTs) || 0;
+      for (const msg of messages) {
+        if (msg && msg.user === userId && Number(msg.ts) > hisLastTs) hisLastTs = Number(msg.ts);
+      }
+      const repliesAfter = messages.filter(
+        (msg) => msg && msg.user && msg.user !== userId && Number(msg.ts) > hisLastTs
+      );
+      if (repliesAfter.length === 0) continue; // he had the last word
+      const newest = repliesAfter[repliesAfter.length - 1];
+      if (skipTs.has(newest.ts)) continue; // already surfaced as a mention
+
+      let from = newest.user;
+      if (nameCache.has(newest.user)) {
+        from = nameCache.get(newest.user);
+      } else {
+        try {
+          const user = await slackUserGet("users.info", { user: newest.user });
+          from = (user.user && (user.user.real_name || user.user.name)) || from;
+        } catch (err) {
+          // users:read may not be granted - the raw id is fine.
+        }
+        nameCache.set(newest.user, from);
+      }
+
+      const item = {
+        text: (newest.text || "").replace(/\s+/g, " ").trim(),
+        permalink: `${teamUrl}archives/${candidate.channelId}/p${String(newest.ts).replace(".", "")}?thread_ts=${candidate.threadTs}&cid=${candidate.channelId}`,
+        from,
+        channel: candidate.channelName,
+        ts: newest.ts,
+        repliesAfterUser: repliesAfter.length,
+      };
+      const classified = classifyThreadReply(item, nameFragments);
+      if (classified) items.push({ ...item, ...classified });
+    }
+  }
+
+  return items.sort(byTierThenNewest).slice(0, SHOWN_LIMIT);
+}
+
+/**
  * Fetches the section data with the user token:
  *   - mentions: recent messages mentioning <@me> (search.messages, newest
  *     first, others' messages only, last MENTION_WINDOW_DAYS days)
  *   - dms: DM conversations with unreads (conversations.list types=im,
  *     newest-updated first, top DM_SCAN_LIMIT checked via conversations.info)
+ *   - threads: replies in threads he participates in that he hasn't answered
+ *     (getThreadItems above), deduped against the two lists before it
  * Never throws: returns { configured: false } when unconfigured, or
- * { configured: true, error } on failure.
+ * { configured: true, error } on failure. A thread-following failure (for
+ * example the token lacking channels:history) degrades to threads: [] and a
+ * log line — mentions and DMs still render.
  */
 async function getHomeData() {
   if (!isConfigured()) return { configured: false };
@@ -145,6 +326,7 @@ async function getHomeData() {
       .slice(0, DM_SCAN_LIMIT);
 
     const dms = [];
+    const dmChannelIds = [];
     for (let i = 0; i < candidates.length && dms.length < SHOWN_LIMIT; i += INFO_CONCURRENCY) {
       const batch = await Promise.all(
         candidates.slice(i, i + INFO_CONCURRENCY).map((c) =>
@@ -165,6 +347,7 @@ async function getHomeData() {
           // users:read may not be granted - the raw id is fine.
         }
         const leadership = isLeadershipName(name);
+        dmChannelIds.push(channel.id);
         dms.push({
           name,
           unread: channel.unread_count_display,
@@ -177,7 +360,25 @@ async function getHomeData() {
     }
     dms.sort((a, b) => a.tier - b.tier || b.unread - a.unread);
 
-    return { configured: true, mentions, dms };
+    // --- Threads he participates in, with unanswered replies ------------------
+    // Deduped against the mention/DM lists above. A failure here (for
+    // example the token lacking channels:history) degrades to threads: []
+    // with a log line — mentions and DMs still render.
+    let threads = [];
+    try {
+      const selfNameFragments = [String(auth.user || "").toLowerCase().trim()].filter(Boolean);
+      threads = await getThreadItems(
+        userId,
+        teamUrl,
+        selfNameFragments,
+        new Set(mentions.map((m) => m.ts)),
+        new Set(dmChannelIds)
+      );
+    } catch (err) {
+      console.error("Slack thread-following fetch failed:", err);
+    }
+
+    return { configured: true, mentions, dms, threads };
   } catch (err) {
     console.error("Slack needs-you fetch failed:", err);
     return { configured: true, error: err.message };
@@ -198,8 +399,8 @@ function linkLabel(text, max) {
 /**
  * Builds the "💬 Slack needs you" Home blocks from getHomeData()'s result:
  * a "not configured" note when the user token is absent, a warning line on
- * fetch errors, otherwise the recent-mentions and unread-DM lists plus an
- * honest read-only footnote.
+ * fetch errors, otherwise the recent-mentions, thread-replies and unread-DM
+ * lists plus an honest read-only footnote.
  *
  * @param {object|null|undefined} data - getHomeData() result
  * @returns {Array<object>}
@@ -233,8 +434,9 @@ function buildNeedsYouBlocks(data) {
 
   const mentions = Array.isArray(data.mentions) ? data.mentions : [];
   const dms = Array.isArray(data.dms) ? data.dms : [];
+  const threads = Array.isArray(data.threads) ? data.threads : [];
 
-  if (mentions.length === 0 && dms.length === 0) {
+  if (mentions.length === 0 && dms.length === 0 && threads.length === 0) {
     blocks.push({
       type: "section",
       text: { type: "mrkdwn", text: "✨ Nothing needs you right now." },
@@ -256,6 +458,25 @@ function buildNeedsYouBlocks(data) {
             text: `🔔 ${m.permalink ? `<${m.permalink}|${label}>` : label} (${linkLabel(m.from, 30)}${where})\n_→ ${m.why}_`,
           },
           accessory: buildCaptureButton(`Reply to ${m.from}: ${m.text}`, m.permalink),
+        });
+      });
+    }
+    if (threads.length > 0) {
+      blocks.push({
+        type: "section",
+        text: { type: "mrkdwn", text: "*Replies in your threads* (ranked):" },
+      });
+      threads.forEach((t, index) => {
+        const label = linkLabel(t.text, MENTION_TEXT_MAX);
+        const where = t.channel ? ` — #${t.channel}` : "";
+        blocks.push({
+          type: "section",
+          block_id: `needsyou_t_${index}`,
+          text: {
+            type: "mrkdwn",
+            text: `🧵 ${t.permalink ? `<${t.permalink}|${label}>` : label} (${linkLabel(t.from, 30)}${where})\n_→ ${t.why}_`,
+          },
+          accessory: buildCaptureButton(`Reply in thread to ${t.from}: ${t.text}`, t.permalink),
         });
       });
     }
@@ -319,4 +540,8 @@ module.exports = {
   isConfigured,
   getHomeData,
   buildNeedsYouBlocks,
+  // Pure thread-following helpers, exported for tests.
+  parseThreadTs,
+  mentionsNameWithoutTag,
+  classifyThreadReply,
 };

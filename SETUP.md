@@ -63,8 +63,10 @@ label-removal only.
 
 ## 💬 Slack needs you (`SLACK_USER_TOKEN`)
 
-A read-only section listing your most recent unread mentions and DMs,
-**ranked** — leadership first (name fragments from the optional
+A read-only section listing your most recent unread mentions, replies in
+threads you participate in (even when they don't @-mention you — the scan
+follows your recent threads and surfaces ones you haven't answered), and
+unread DMs, **ranked** — leadership first (name fragments from the optional
 `SLACK_LEADERSHIP_NAMES` env var, comma-separated, default `ben`), direct
 questions next, then newest — with a one-line "why this matters" per item
 and a **📥 Capture as task** button that queues the item into triage (same
@@ -79,16 +81,24 @@ This needs a *user* token (acts as you, read-only), not the bot token:
 1. Open <https://api.slack.com/apps> → this app → **OAuth & Permissions**.
 2. Under **User Token Scopes** (not Bot Token Scopes) add the minimal read
    set:
-   - `search:read` — find recent messages that mention you
+   - `search:read` — find recent messages that mention you (and your own
+     recent messages, which seed thread-following)
    - `im:read` — list your DM conversations (unread counts)
    - `im:history` — read DM message metadata
-   - `users:read` *(optional)* — show DM partners by name instead of user id
+   - `channels:history` — read thread replies in public channels; powers
+     thread-following
+   - `groups:history` — read thread replies in private channels; powers
+     thread-following
+   - `users:read` *(optional)* — show DM partners and thread repliers by
+     name instead of user id
 3. **Reinstall to Workspace** (Slack will show you exactly these scopes),
    then copy the **User OAuth Token** (`xoxp-…`).
 4. Set `SLACK_USER_TOKEN=xoxp-…`.
 
 Optional: `SLACK_DM_SCAN_LIMIT` (default 60) — how many recent DM
-conversations are checked for unreads per refresh.
+conversations are checked for unreads per refresh — and
+`SLACK_THREAD_SCAN_LIMIT` (default 20, max 50) — how many of your recent
+threads the thread-following scan checks for unanswered replies.
 
 ## 📅 Calendar quick actions — no setup
 
