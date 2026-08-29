@@ -203,6 +203,10 @@ best-effort re-publishes the Home view with the row marked
 ]
 ```
 
+Entries may also be **bare strings** (`"Book PA offsite travel"`), which are
+normalized to `{ id: "s<index>", text, source: "manual" }` — the same is
+true of `delegated` entries, whose leading 🟢/🟡/🔴 becomes the status.
+
 | Field | Type | Meaning |
 | --- | --- | --- |
 | `id` | string, required | Stable task id (echoed back on completion). |
@@ -218,9 +222,10 @@ present) plus a buttons row with **✅ Complete** (`action_id:
 "task_complete"`, whose `value` carries `{taskId, text, source, link}`) and
 **🤖 Do it** (`action_id: "home_task_bot"`, whose `value` carries
 `{id, text (≤140 chars), link?, source?}`) — both values stay under Slack's
-2000-char button-value cap. At most **20 tasks** are rendered (two blocks
-each, keeping the Home view safely under Slack's 100-block limit); extras
-collapse into an "…and N more" context line.
+2000-char button-value cap. At most **20 tasks** get interactive rows (two
+blocks each; the cap shrinks automatically when the whole view would exceed
+Slack's 100-block limit); **every task past the cap still renders** in a
+compact "…and N more" list — nothing is silently truncated.
 
 Clicking **✅ Complete** pushes a `task_complete` entry onto the delegation
 queue (see `/delegations/pending`) and best-effort re-publishes the Home
@@ -433,6 +438,14 @@ the queue.
 | `PORT` | Port to listen on (Render sets this automatically; defaults to `3000` locally). |
 | `DATA_DIR` | *Optional.* Directory for the persisted delegation queue file (`delegations.json`); defaults to the OS temp dir. Point it at a persistent disk for maximum durability. |
 | `SLACK_API_BASE` | *Optional, tests only.* Overrides the Slack Web API base URL (`https://slack.com/api`) so local tests can target a mock server. Leave unset in production. |
+
+Optional Home-tab feature vars — `GMAIL_CLIENT_ID` / `GMAIL_CLIENT_SECRET` /
+`GMAIL_REFRESH_TOKEN` (📧 Gmail cleanup section, archive-only) and
+`SLACK_USER_TOKEN` (💬 read-only "Slack needs you" section) — are documented
+in [SETUP.md](SETUP.md); with them unset the sections render a short
+"not connected" note and nothing else changes. The 📅 Calendar quick-action
+buttons need no config: they queue `calendar_block` / `calendar_move`
+delegation entries for the hourly sweep.
 
 See `.env.example`.
 
