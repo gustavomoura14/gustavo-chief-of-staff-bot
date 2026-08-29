@@ -86,14 +86,15 @@ function rewriteCalendarButton(viewBlocks, actionId, newLabel) {
 
 /**
  * Handles clicks on the extra sections' buttons. Returns true when the
- * action was one of ours (calendar quick actions / Gmail archive) — the
- * caller then stops — and false otherwise. `ctx` is supplied by server.js:
- * { delegations, saveDelegations, republishHomeView }.
+ * action was one of ours (calendar quick actions / meeting-move picker /
+ * needs-you capture / Gmail archive) — the caller then stops — and false
+ * otherwise. `ctx` is supplied by server.js:
+ * { delegations, saveDelegations, republishHomeView, openMeetingMoveModal }.
  *
  * @param {object} action - payload.actions[0]
  * @param {object} payload - the parsed Slack interactivity payload
  * @param {{delegations: Array<object>, saveDelegations: Function,
- *          republishHomeView: Function}} ctx
+ *          republishHomeView: Function, openMeetingMoveModal: Function}} ctx
  * @returns {Promise<boolean>}
  */
 async function handleExtraAction(action, payload, ctx) {
@@ -101,10 +102,71 @@ async function handleExtraAction(action, payload, ctx) {
   const userId = payload.user && payload.user.id;
   const canRepublish = view && view.type === "home" && Array.isArray(view.blocks) && userId;
 
+  // --- 📅 "Flag a meeting to move" ------------------------------------------
+  // Opens the meeting-move modal (see calendar.js) instead of queueing a
+  // bare entry — the calendar_move delegation is queued by the modal's
+  // view_submission handler in server.js, WITH the meeting and the change.
+  // The button is NOT rewritten in place: the modal is the feedback, and the
+  // picker stays reusable for the next meeting.
+  if (action.action_id === "calendar_move_flag") {
+    await ctx.openMeetingMoveModal(payload);
+    return true;
+  }
+
+  // --- 💬 "📥 Capture as task" ----------------------------------------------
+  // On a "Slack needs you" row (see slack_user.js). Queue a "triage_add"
+  // delegation entry — same type as the "Add to Triage" message shortcut —
+  // then mark the clicked row "→ 📥 captured" in place, dropping its button
+  // so it can't be double-captured.
+  if (action.action_id === "needsyou_capture") {
+    let value = {};
+    try {
+      value = JSON.parse(action.value) || {};
+    } catch (err) {
+      console.error("needsyou_capture click carried an unparseable value - queueing bare entry");
+    }
+    ctx.delegations.push({
+      id: `triage-${Date.now()}`,
+      type: "triage_add",
+      text: value.text || "",
+      channel: null,
+      message_ts: null,
+      permalink: value.link || null,
+      clickedAt: new Date().toISOString(),
+      status: "pending",
+    });
+    ctx.saveDelegations();
+
+    if (canRepublish) {
+      let changed = false;
+      const newBlocks = view.blocks.map((block) => {
+        if (
+          !block ||
+          block.block_id !== action.block_id ||
+          !block.text ||
+          typeof block.text.text !== "string"
+        ) {
+          return block;
+        }
+        changed = true;
+        const { accessory, ...rest } = block; // drop the clicked button
+        let newText = `${rest.text.text} → 📥 captured`;
+        if (newText.length > MAX_SECTION_TEXT) {
+          newText = `${newText.slice(0, MAX_SECTION_TEXT - 1)}…`;
+        }
+        return { ...rest, text: { ...rest.text, text: newText } };
+      });
+      if (changed) {
+        await ctx.republishHomeView(userId, newBlocks, "needsyou_capture");
+      }
+    }
+    return true;
+  }
+
   // --- 📅 Calendar quick actions -------------------------------------------
-  // Queue a "calendar_block" / "calendar_move" delegation entry carrying the
-  // button's duration/day payload, then mark the clicked button "✅ Queued"
-  // in place (Home clicks have no response_url, so views.publish it is).
+  // Queue a "calendar_block" delegation entry carrying the button's
+  // duration/day payload, then mark the clicked button "✅ Queued" in place
+  // (Home clicks have no response_url, so views.publish it is).
   if (CALENDAR_ACTION_IDS.has(action.action_id)) {
     let value = {};
     try {

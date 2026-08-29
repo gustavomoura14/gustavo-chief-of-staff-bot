@@ -23,9 +23,11 @@
  *     bubble to the top
  *
  * SAFETY INVARIANTS (enforced in code, not just documented):
- *   - archive-only: the ONLY mutation in this module is threads.modify
- *     { removeLabelIds: ["INBOX"] }. There is no code path that trashes,
- *     deletes, or spams anything.
+ *   - the ONLY mutations in this module are threads.modify
+ *     { removeLabelIds: ["INBOX"] } (archive) and drafts.create (writes a
+ *     DRAFT into Gustavo's Drafts folder — see createDraft). There is no
+ *     code path that trashes, deletes, spams, or SENDS anything: sending is
+ *     always Gustavo's own manual act, from Gmail.
  *   - starred threads and threads Gustavo replied to are NEVER archived:
  *     they are excluded from the low-priority bucket at triage time AND
  *     re-checked immediately before each modify call in
@@ -260,6 +262,39 @@ async function archiveLowPriority() {
   return { archived, skipped };
 }
 
+/** RFC 2047-encodes a header value when it carries non-ASCII characters. */
+function encodeHeaderValue(value) {
+  const text = String(value == null ? "" : value);
+  if (!/[^\x20-\x7e]/.test(text)) return text;
+  return `=?UTF-8?B?${Buffer.from(text, "utf8").toString("base64")}?=`;
+}
+
+/**
+ * Creates a REAL Gmail draft (users.drafts.create) from plain to/subject/body
+ * fields. The draft lands in Gustavo's Drafts folder for him to review, edit
+ * and send HIMSELF — this module contains no send call of any kind.
+ *
+ * @param {{to: string, subject?: string, body: string}} draft
+ * @returns {Promise<{id: string, messageId: string|null}>} the Gmail draft id
+ *   plus the draft message's id (used to deep-link straight to the draft)
+ */
+async function createDraft({ to, subject, body }) {
+  const raw = Buffer.from(
+    [
+      `To: ${String(to)}`,
+      `Subject: ${encodeHeaderValue(subject || "")}`,
+      'Content-Type: text/plain; charset="UTF-8"',
+      "MIME-Version: 1.0",
+      "",
+      String(body == null ? "" : body),
+    ].join("\r\n"),
+    "utf8"
+  ).toString("base64url");
+
+  const json = await gmailPost("/users/me/drafts", { message: { raw } });
+  return { id: json.id, messageId: (json.message && json.message.id) || null };
+}
+
 /**
  * Fetches the Home-section data. Never throws: returns
  * { configured: false } when the env vars are absent (no request made), or
@@ -405,6 +440,7 @@ module.exports = {
   isConfigured,
   triageInbox,
   archiveLowPriority,
+  createDraft,
   getHomeData,
   buildGmailBlocks,
   classifyThread,

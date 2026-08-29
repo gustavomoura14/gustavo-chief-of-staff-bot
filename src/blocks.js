@@ -457,7 +457,7 @@ function buildSecItemExtrasBlock(item) {
   ];
 
   if (typeof item.draft === "string" && item.draft) {
-    elements.push(buildDraftButton(item.draft));
+    elements.push(buildDraftButton(item.draft, item.draft_id));
   }
 
   return {
@@ -494,23 +494,35 @@ function isDraftItem(item) {
 }
 
 /**
- * Builds the "📝 View draft" button (action_id `sec_item_view_draft`). The
- * value is JSON {type: "view_draft", draft} with the draft text truncated
- * (shrink-and-recheck, since JSON escaping means char counts don't map 1:1)
- * to stay under Slack's 2000-char button-value cap. Clicking opens a modal
- * showing the draft in a copyable code block - display only, nothing is
- * sent.
+ * Builds the "📝 View draft" button (action_id `sec_item_view_draft`).
+ * Clicking opens a modal showing the draft in a copyable code block -
+ * display only, nothing is sent.
+ *
+ * When the server stored the full draft text server-side (see /render-brief
+ * in server.js), `draftId` is set and the value is just JSON
+ * {type: "view_draft", draft_id} - the interactions handler reads the FULL
+ * text back from storage, so drafts are no longer capped by Slack's
+ * 2000-char button-value limit. Without an id (older callers/messages) the
+ * legacy inline shape {type: "view_draft", draft} is kept, with the draft
+ * text truncated (shrink-and-recheck, since JSON escaping means char counts
+ * don't map 1:1) to stay under that cap.
  *
  * @param {string} draft
+ * @param {string} [draftId] - server-side storage key for the full draft
  * @returns {object} Slack Block Kit button element
  */
-function buildDraftButton(draft) {
-  let text = String(draft);
-  let value = JSON.stringify({ type: "view_draft", draft: text });
-  while (value.length > DRAFT_VALUE_SOFT_MAX && text.length > 1) {
-    const overshoot = value.length - DRAFT_VALUE_SOFT_MAX;
-    text = `${text.slice(0, Math.max(0, text.length - overshoot - 1))}…`;
+function buildDraftButton(draft, draftId) {
+  let value;
+  if (typeof draftId === "string" && draftId) {
+    value = JSON.stringify({ type: "view_draft", draft_id: draftId });
+  } else {
+    let text = String(draft);
     value = JSON.stringify({ type: "view_draft", draft: text });
+    while (value.length > DRAFT_VALUE_SOFT_MAX && text.length > 1) {
+      const overshoot = value.length - DRAFT_VALUE_SOFT_MAX;
+      text = `${text.slice(0, Math.max(0, text.length - overshoot - 1))}…`;
+      value = JSON.stringify({ type: "view_draft", draft: text });
+    }
   }
   return {
     type: "button",
@@ -537,7 +549,7 @@ function buildDraftItemBlock(raw) {
   return {
     type: "section",
     text: { type: "mrkdwn", text: truncate(line, MAX_SECTION_TEXT) },
-    accessory: buildDraftButton(raw.draft),
+    accessory: buildDraftButton(raw.draft, raw.draft_id),
   };
 }
 

@@ -1,7 +1,10 @@
 "use strict";
 
 /**
- * "💬 Slack needs you" App Home section (v1: READ-ONLY surfacing).
+ * "💬 Slack needs you" App Home section: READ-ONLY surfacing, now RANKED
+ * (leadership first, direct questions next, then age — see the ranking
+ * helpers below) with a one-line "why this matters" per item and a
+ * "📥 Capture as task" button that queues a triage_add delegation entry.
  *
  * Uses an OPTIONAL user-authorized token (SLACK_USER_TOKEN, xoxp-…) that
  * Gustavo installs himself with minimal read scopes — `search:read`,
@@ -28,6 +31,47 @@ const INFO_CONCURRENCY = 5;
 const MENTION_WINDOW_DAYS = 3;
 
 const MENTION_TEXT_MAX = 90;
+
+// ---------------------------------------------------------------------------
+// Ranking. Surfaced items are ordered leadership-first (name fragments from
+// SLACK_LEADERSHIP_NAMES, comma-separated, defaulting to "ben"), then direct
+// questions, then by age (newest first) — and each carries a one-line "why
+// this matters" so the list explains its own order.
+// ---------------------------------------------------------------------------
+
+const LEADERSHIP_NAME_FRAGMENTS = (process.env.SLACK_LEADERSHIP_NAMES || "ben")
+  .split(",")
+  .map((name) => name.trim().toLowerCase())
+  .filter(Boolean);
+
+/** True when a display name matches one of the leadership name fragments. */
+function isLeadershipName(name) {
+  const lower = String(name || "").toLowerCase();
+  return LEADERSHIP_NAME_FRAGMENTS.some((fragment) => lower.includes(fragment));
+}
+
+// A mention that reads like it's waiting on an answer from Gustavo.
+const DIRECT_QUESTION_RE = /\?|can you|could you|would you|please|need(s)? (you|your)|what do you think|thoughts/i;
+
+/**
+ * Attaches {tier, why} to one mention: tier 0 leadership, 1 direct question,
+ * 2 everything else. `why` is the one-line "why this matters" rendered under
+ * the item.
+ */
+function classifyMention(mention) {
+  if (isLeadershipName(mention.from)) {
+    return { tier: 0, why: "leadership ping — answer first" };
+  }
+  if (DIRECT_QUESTION_RE.test(mention.text || "")) {
+    return { tier: 1, why: "direct question waiting on you" };
+  }
+  return { tier: 2, why: "recent mention" };
+}
+
+/** Sorts classified items: tier ascending, then newest first. */
+function byTierThenNewest(a, b) {
+  return a.tier - b.tier || (Number(b.ts) || 0) - (Number(a.ts) || 0);
+}
 
 /** True when the optional user token is set. */
 function isConfigured() {
@@ -73,13 +117,18 @@ async function getHomeData() {
     const cutoff = (Date.now() - MENTION_WINDOW_DAYS * 24 * 60 * 60 * 1000) / 1000;
     const mentions = (((search.messages || {}).matches) || [])
       .filter((m) => m && m.user !== userId && Number(m.ts) >= cutoff)
-      .slice(0, SHOWN_LIMIT)
-      .map((m) => ({
-        text: (m.text || "").replace(/\s+/g, " ").trim(),
-        permalink: m.permalink || null,
-        from: m.username || "someone",
-        channel: (m.channel && m.channel.name) || null,
-      }));
+      .map((m) => {
+        const mention = {
+          text: (m.text || "").replace(/\s+/g, " ").trim(),
+          permalink: m.permalink || null,
+          from: m.username || "someone",
+          channel: (m.channel && m.channel.name) || null,
+          ts: m.ts,
+        };
+        return { ...mention, ...classifyMention(mention) };
+      })
+      .sort(byTierThenNewest)
+      .slice(0, SHOWN_LIMIT);
 
     // --- Unread DMs ----------------------------------------------------------
     // conversations.list gives no unread counts, so the most recently updated
@@ -115,14 +164,18 @@ async function getHomeData() {
         } catch (err) {
           // users:read may not be granted - the raw id is fine.
         }
+        const leadership = isLeadershipName(name);
         dms.push({
           name,
           unread: channel.unread_count_display,
           link: `${teamUrl}archives/${channel.id}`,
+          tier: leadership ? 0 : 2,
+          why: leadership ? "leadership DM — answer first" : "unread DM",
         });
         if (dms.length >= SHOWN_LIMIT) break;
       }
     }
+    dms.sort((a, b) => a.tier - b.tier || b.unread - a.unread);
 
     return { configured: true, mentions, dms };
   } catch (err) {
@@ -188,23 +241,39 @@ function buildNeedsYouBlocks(data) {
     });
   } else {
     if (mentions.length > 0) {
-      const lines = mentions.map((m) => {
-        const label = linkLabel(m.text, MENTION_TEXT_MAX);
-        const where = m.channel ? ` — #${m.channel}` : "";
-        return `🔔 ${m.permalink ? `<${m.permalink}|${label}>` : label} (${linkLabel(m.from, 30)}${where})`;
-      });
       blocks.push({
         type: "section",
-        text: { type: "mrkdwn", text: `*Recent mentions:*\n${lines.join("\n")}` },
+        text: { type: "mrkdwn", text: "*Recent mentions* (ranked):" },
+      });
+      mentions.forEach((m, index) => {
+        const label = linkLabel(m.text, MENTION_TEXT_MAX);
+        const where = m.channel ? ` — #${m.channel}` : "";
+        blocks.push({
+          type: "section",
+          block_id: `needsyou_m_${index}`,
+          text: {
+            type: "mrkdwn",
+            text: `🔔 ${m.permalink ? `<${m.permalink}|${label}>` : label} (${linkLabel(m.from, 30)}${where})\n_→ ${m.why}_`,
+          },
+          accessory: buildCaptureButton(`Reply to ${m.from}: ${m.text}`, m.permalink),
+        });
       });
     }
     if (dms.length > 0) {
-      const lines = dms.map(
-        (d) => `✉️ <${d.link}|${linkLabel(d.name, 40)}> — ${d.unread} unread`
-      );
       blocks.push({
         type: "section",
-        text: { type: "mrkdwn", text: `*Unread DMs:*\n${lines.join("\n")}` },
+        text: { type: "mrkdwn", text: "*Unread DMs* (ranked):" },
+      });
+      dms.forEach((d, index) => {
+        blocks.push({
+          type: "section",
+          block_id: `needsyou_d_${index}`,
+          text: {
+            type: "mrkdwn",
+            text: `✉️ <${d.link}|${linkLabel(d.name, 40)}> — ${d.unread} unread\n_→ ${d.why}_`,
+          },
+          accessory: buildCaptureButton(`Reply to ${d.name}'s DM (${d.unread} unread)`, d.link),
+        });
       });
     }
   }
@@ -214,12 +283,36 @@ function buildNeedsYouBlocks(data) {
     elements: [
       {
         type: "mrkdwn",
-        text: "Read-only: Slack's API doesn't support bulk-cleaning your inbox — open each item to handle it.",
+        text: "Read-only surfacing: Slack's API doesn't support bulk-cleaning your inbox — open each item to handle it, or 📥 Capture it as a triage task.",
       },
     ],
   });
 
   return blocks;
+}
+
+// Capture-button value text cap (same convention as home.js task values).
+const CAPTURE_TEXT_MAX = 140;
+
+/**
+ * "📥 Capture as task" accessory (action_id `needsyou_capture`). Clicking
+ * queues a "triage_add" delegation entry — same type the "Add to Triage"
+ * message shortcut produces, so the agent-side drain handles both
+ * identically. Value carries {text (truncated), link}.
+ *
+ * @param {string} text
+ * @param {string|null} link
+ * @returns {object} Slack Block Kit button element
+ */
+function buildCaptureButton(text, link) {
+  const value = { text: String(text || "").slice(0, CAPTURE_TEXT_MAX) };
+  if (typeof link === "string" && link) value.link = link;
+  return {
+    type: "button",
+    action_id: "needsyou_capture",
+    text: { type: "plain_text", text: "📥 Capture as task", emoji: true },
+    value: JSON.stringify(value),
+  };
 }
 
 module.exports = {
