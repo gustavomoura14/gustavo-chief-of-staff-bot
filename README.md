@@ -412,6 +412,47 @@ original Slack message the 🤖 button was clicked in (using the entry's stored
   Slack's own error otherwise). **The entry is marked either way** — an
   `ok: false` only means the visual strikeout didn't happen.
 
+### `GET /state/priorities`
+
+Returns the persisted 🔼/🔽 **priority signal** so the external brief
+generator can respect Gustavo's ordering on the next render.
+
+- Auth: header `X-Internal-Secret`, as above. Missing or wrong → `401`.
+- Responds
+  `{ "ok": true, "updatedAt": ..., "order": [{ "id", "text", "done" }, ...], "overrides": { "<id>": { "action": "item_up"|"item_down", "at": ... } } }`
+  — `order` is the full ordering after the latest reorder click; `overrides`
+  records which items were explicitly moved. Empty state:
+  `{ "ok": true, "updatedAt": null, "order": [], "overrides": {} }`.
+
+### `GET /state/completions`
+
+Returns the **completions log** — every done-style click (`item_done`,
+`urgent_done`, `task_complete`), newest last.
+
+- Auth: header `X-Internal-Secret`, as above. Missing or wrong → `401`.
+- Responds `{ "ok": true, "items": [{ "id", "text", "source", "clickedAt" }, ...] }`.
+  A logged ✅ means "done or no longer needed" — final: consumers stop
+  resurfacing the item; nothing verifies or nags.
+
+### `POST /drafts`
+
+**Draft-only delivery** — gets a reply into Gustavo's hands ready to send;
+the app never sends anything as him (no `gmail.send`, no user-token
+`chat:write`, anywhere). See `src/drafts.js` and [SETUP.md](SETUP.md).
+
+- Auth: header `X-Internal-Secret`, as above. Missing or wrong → `401`.
+- Body: `{ "kind": "email", "to": ..., "subject"?: ..., "text"?: ..., "context"?: {...} }`
+  or `{ "kind": "slack", "channel"?: ..., "to"?: ..., "text"?: ..., "context"?: {...} }`.
+  With `text` omitted, the draft is generated via the optional AI helper
+  (`ANTHROPIC_API_KEY` + `ANTHROPIC_MODEL` — otherwise `400`).
+- `"email"` (needs the Gmail env vars): creates a **real Gmail draft** and
+  responds `{ "ok": true, "kind": "email", "draft_id", "link", "notified" }`
+  (`link` opens Gmail Drafts; `notified` is whether the CoS-channel
+  heads-up with the **Open in Gmail Drafts** button was posted).
+- `"slack"` (needs `COS_CHANNEL`): the bot posts the ready-to-paste text to
+  the CoS channel in a code block (plus a deep link to `channel` when
+  given) and responds `{ "ok": true, "kind": "slack", "ts", "channel", "conversation_link" }`.
+
 ## Queue durability
 
 The delegation queue lives in memory **and is mirrored to a JSON file on
@@ -439,13 +480,17 @@ the queue.
 | `DATA_DIR` | *Optional.* Directory for the persisted delegation queue file (`delegations.json`); defaults to the OS temp dir. Point it at a persistent disk for maximum durability. |
 | `SLACK_API_BASE` | *Optional, tests only.* Overrides the Slack Web API base URL (`https://slack.com/api`) so local tests can target a mock server. Leave unset in production. |
 
-Optional Home-tab feature vars — `GMAIL_CLIENT_ID` / `GMAIL_CLIENT_SECRET` /
-`GMAIL_REFRESH_TOKEN` (📧 Gmail cleanup section, archive-only) and
-`SLACK_USER_TOKEN` (💬 read-only "Slack needs you" section) — are documented
-in [SETUP.md](SETUP.md); with them unset the sections render a short
-"not connected" note and nothing else changes. The 📅 Calendar quick-action
-buttons need no config: they queue `calendar_block` / `calendar_move`
-delegation entries for the hourly sweep.
+Optional feature vars — `GMAIL_CLIENT_ID` / `GMAIL_CLIENT_SECRET` /
+`GMAIL_REFRESH_TOKEN` (📧 Gmail cleanup section + email drafts),
+`SLACK_USER_TOKEN` (💬 ranked "Slack needs you" section, with the optional
+`SLACK_LEADERSHIP_NAMES`), `ANTHROPIC_API_KEY` + `ANTHROPIC_MODEL` (🤖 AI
+drafting; both required, no model id is hardcoded) and `COS_CHANNEL`
+(📬 draft-only delivery) — are documented in [SETUP.md](SETUP.md); with them
+unset the corresponding features are fully off and nothing else changes.
+The 📅 Calendar quick-action buttons need no config: they queue
+`calendar_block` delegation entries for the hourly sweep, and "Flag a
+meeting to move" opens a picker modal whose submission queues a
+`calendar_move` entry carrying the meeting and the requested change.
 
 See `.env.example`.
 

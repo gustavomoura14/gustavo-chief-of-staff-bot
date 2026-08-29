@@ -18,6 +18,16 @@ const {
 const { verifySlackSignature } = require("./verify");
 const { buildHomeView } = require("./home");
 const { gatherHomeExtras, buildExtrasBlocks, handleExtraAction } = require("./home_extras");
+const { createStore } = require("./storage");
+const {
+  buildMeetingMoveModal,
+  MEETING_MOVE_CALLBACK_ID,
+  MEETING_MOVE_SELECT_BLOCK_ID,
+  MEETING_MOVE_SELECT_ACTION_ID,
+  MEETING_MOVE_INPUT_BLOCK_ID,
+  MEETING_MOVE_INPUT_ACTION_ID,
+} = require("./calendar");
+const { deliverDraft } = require("./drafts");
 
 const app = express();
 const PORT = process.env.PORT || 3000;
@@ -86,8 +96,12 @@ const SLACK_API_BASE = process.env.SLACK_API_BASE || "https://slack.com/api";
 //                     { id: "calblock-<ms>", type, duration_minutes, day
 //                     ("today"|"tomorrow"), when ("now"|null), title,
 //                     clickedAt, status }
-//   - "calendar_move" (📅 "Flag a meeting to move"): shaped
-//                     { id: "calmove-<ms>", type, clickedAt, status }
+//   - "calendar_move" (📅 meeting-move modal submission — the "Flag a
+//                     meeting to move" button opens a picker; see
+//                     processInteraction's view_submission branch): shaped
+//                     { id: "calmove-<ms>", type, meeting_title,
+//                     meeting_start, meeting_organizer, meeting_link,
+//                     requested_change, clickedAt, status }
 //   (📝 "View draft" clicks queue NOTHING - they open a display-only modal)
 //   - "refresh"       (🔄 Refresh brief button, on briefs and the Home tab):
 //                     shaped { id: "refresh-<ms>", type, requested_at,
@@ -130,6 +144,46 @@ function saveDelegations() {
   } catch (err) {
     console.error(`Failed to persist delegation queue to ${DELEGATIONS_FILE}:`, err);
   }
+}
+
+// ---------------------------------------------------------------------------
+// Server-side state stores (see storage.js — one JSON file each under
+// DATA_DIR, loaded once, persisted on every set()):
+//   - priorities:  per-item priority overrides from 🔼/🔽 clicks. Shape
+//     { updatedAt, order: [{id, text, done}], overrides: {<id>: {action, at}} }
+//     — `order` is the FULL post-click ordering, `overrides` records which
+//     items Gustavo explicitly moved. Read back via GET /state/priorities so
+//     the external brief generator can respect his ordering.
+//   - completions: append-only log of done-style clicks (item_done /
+//     urgent_done / task_complete). Shape { items: [{id, text, source,
+//     clickedAt}] }, capped at the newest COMPLETIONS_MAX. Read back via
+//     GET /state/completions. A ✅ means "done or no longer needed" — final;
+//     nothing re-checks or nags about logged completions.
+//   - drafts: full draft texts keyed by item id ({ items: {<id>: {text,
+//     createdAt}} }), so "📝 View draft" buttons carry only the id instead
+//     of a ~1900-char-truncated copy (see /render-brief + blocks.js).
+//   - meetings: the latest /render-brief payload's `meetings` array
+//     ({ updatedAt, meetings: [{title, start, end, organizer, link}] }),
+//     used to populate the meeting-move picker modal.
+// ---------------------------------------------------------------------------
+const prioritiesStore = createStore("priorities", { updatedAt: null, order: [], overrides: {} });
+const completionsStore = createStore("completions", { items: [] });
+const draftsStore = createStore("drafts", { items: {} });
+const meetingsStore = createStore("meetings", { updatedAt: null, meetings: [] });
+
+const COMPLETIONS_MAX = 1000;
+
+/** Appends one entry to the completions log (capped at COMPLETIONS_MAX). */
+function appendCompletion({ id, text, source }) {
+  const state = completionsStore.get() || {};
+  const items = Array.isArray(state.items) ? state.items : [];
+  items.push({
+    id: id != null ? id : null,
+    text: text || "",
+    source: source || "manual",
+    clickedAt: new Date().toISOString(),
+  });
+  completionsStore.set({ items: items.slice(-COMPLETIONS_MAX) });
 }
 
 // Workspace host used to build permalinks for "Add to Triage" shortcut
@@ -198,8 +252,61 @@ app.get("/healthz", (req, res) => {
 // ---------------------------------------------------------------------------
 const RENDER_BODY_LIMIT = "1mb";
 
+// How many meetings / stored drafts are kept server-side per brief. Modest
+// caps: both stores are refreshed by every /render-brief anyway.
+const MEETINGS_MAX = 50;
+const STORED_DRAFTS_MAX = 200;
+
+/** Coerces one payload meeting to {title, start, end, organizer, link} strings. */
+function sanitizeMeeting(raw) {
+  if (!raw || typeof raw !== "object" || raw.title == null) return null;
+  const meeting = { title: String(raw.title) };
+  ["start", "end", "organizer", "link"].forEach((field) => {
+    if (raw[field] != null) meeting[field] = String(raw[field]);
+  });
+  return meeting;
+}
+
+/**
+ * Stores every section item's full `draft` text server-side, keyed by the
+ * item's id (one is minted when missing), and marks the item with that
+ * `draft_id` so blocks.js builds its "📝 View draft" button around the id
+ * alone — full drafts are no longer squeezed (and truncated at ~1900 chars)
+ * into button values. The store keeps the newest STORED_DRAFTS_MAX drafts.
+ *
+ * @param {Array<{items?: Array<object>}>|undefined} sections
+ */
+function storeSectionDrafts(sections) {
+  const now = new Date().toISOString();
+  const state = draftsStore.get() || {};
+  const items = state.items && typeof state.items === "object" ? { ...state.items } : {};
+  let stored = 0;
+
+  (Array.isArray(sections) ? sections : []).forEach((section) => {
+    (section && Array.isArray(section.items) ? section.items : []).forEach((item) => {
+      if (!item || typeof item !== "object") return;
+      if (typeof item.draft !== "string" || !item.draft) return;
+      const id = typeof item.id === "string" && item.id ? item.id : crypto.randomUUID();
+      item.draft_id = id; // consumed by blocks.js buildDraftButton
+      items[id] = { text: item.draft, createdAt: now };
+      stored += 1;
+    });
+  });
+  if (stored === 0) return;
+
+  // Prune oldest-first past the cap.
+  const ids = Object.keys(items);
+  if (ids.length > STORED_DRAFTS_MAX) {
+    ids
+      .sort((a, b) => String(items[a].createdAt || "").localeCompare(String(items[b].createdAt || "")))
+      .slice(0, ids.length - STORED_DRAFTS_MAX)
+      .forEach((id) => delete items[id]);
+  }
+  draftsStore.set({ items });
+}
+
 app.post("/render-brief", requireInternalSecret, express.json({ limit: RENDER_BODY_LIMIT }), async (req, res) => {
-  const { channel, thread_ts, priority_recap, sections, recommendations, title, emoji } =
+  const { channel, thread_ts, priority_recap, sections, recommendations, title, emoji, meetings } =
     req.body || {};
 
   if (!channel) {
@@ -207,9 +314,21 @@ app.post("/render-brief", requireInternalSecret, express.json({ limit: RENDER_BO
       ok: false,
       error: "bad_request",
       message:
-        "Expected { channel, thread_ts?, priority_recap?, sections?, recommendations?, title?, emoji? }",
+        "Expected { channel, thread_ts?, priority_recap?, sections?, recommendations?, title?, emoji?, meetings? }",
     });
   }
+
+  // Persist the payload's upcoming-meetings list (feeds the meeting-move
+  // picker modal) and the full draft texts (feeds the "📝 View draft"
+  // modal). Both are refreshed wholesale by each brief; a payload WITHOUT a
+  // meetings array leaves the stored list untouched.
+  if (Array.isArray(meetings)) {
+    meetingsStore.set({
+      updatedAt: new Date().toISOString(),
+      meetings: meetings.slice(0, MEETINGS_MAX).map(sanitizeMeeting).filter(Boolean),
+    });
+  }
+  storeSectionDrafts(sections);
 
   const blocks = buildBriefBlocks({ priority_recap, sections, recommendations, title, emoji });
 
@@ -621,6 +740,40 @@ async function republishHomeView(userId, blocks, context) {
   }
 }
 
+/**
+ * Opens the meeting-move picker modal (views.open with the interaction's
+ * trigger_id, which expires after 3 seconds — so this runs right after the
+ * ack). The meetings come from the latest /render-brief payload via
+ * meetingsStore; with none on file the modal explains that the next brief
+ * will populate the list. Failures are logged, never thrown.
+ *
+ * @param {object} payload - the parsed Slack interactivity payload
+ */
+async function openMeetingMoveModal(payload) {
+  if (!payload.trigger_id) {
+    console.error("calendar_move_flag click carried no trigger_id - cannot open modal");
+    return;
+  }
+  const stored = meetingsStore.get() || {};
+  const view = buildMeetingMoveModal(Array.isArray(stored.meetings) ? stored.meetings : []);
+  try {
+    const openResponse = await fetch(`${SLACK_API_BASE}/views.open`, {
+      method: "POST",
+      headers: {
+        "Content-Type": "application/json; charset=utf-8",
+        Authorization: `Bearer ${SLACK_BOT_TOKEN}`,
+      },
+      body: JSON.stringify({ trigger_id: payload.trigger_id, view }),
+    });
+    const openJson = await openResponse.json().catch(() => ({}));
+    if (!openJson.ok) {
+      console.error(`views.open for the meeting-move modal failed: ${openJson.error}`);
+    }
+  } catch (err) {
+    console.error("Error opening meeting-move modal:", err);
+  }
+}
+
 app.post(
   "/slack/interactions",
   express.urlencoded({ extended: false, limit: INTERACTIONS_BODY_LIMIT, verify: captureRawBody }),
@@ -666,6 +819,56 @@ app.post(
  * @param {object} payload - the parsed Slack interactivity payload
  */
 async function processInteraction(payload) {
+  // --- Modal submissions (view_submission) --------------------------------
+  // FIRST view_submission handling in the repo: modal submits arrive as
+  // type "view_submission" with no `actions` array. The route already acked
+  // with an empty 200 (which is exactly what closes a modal), so all that is
+  // left is reading view.state.values and queueing. Unknown callback_ids are
+  // ignored — their modals still just close.
+  if (payload && payload.type === "view_submission") {
+    const view = payload.view || {};
+    if (view.callback_id !== MEETING_MOVE_CALLBACK_ID) {
+      return; // unknown modal - already acked (closed); ignore
+    }
+
+    const values = (view.state && view.state.values) || {};
+    const select =
+      values[MEETING_MOVE_SELECT_BLOCK_ID] &&
+      values[MEETING_MOVE_SELECT_BLOCK_ID][MEETING_MOVE_SELECT_ACTION_ID];
+    const details =
+      values[MEETING_MOVE_INPUT_BLOCK_ID] &&
+      values[MEETING_MOVE_INPUT_BLOCK_ID][MEETING_MOVE_INPUT_ACTION_ID];
+    const selectedOption = select && select.selected_option;
+    if (!selectedOption) {
+      console.error("calendar_move_modal submission carried no selected meeting - ignoring");
+      return;
+    }
+
+    // The option value is the meeting's index into the stored list (see
+    // buildMeetingMoveModal); the option's own label is kept as a fallback
+    // in case the stored list was refreshed while the modal was open.
+    const stored = meetingsStore.get() || {};
+    const meetings = Array.isArray(stored.meetings) ? stored.meetings : [];
+    const index = Number(selectedOption.value);
+    const meeting = Number.isInteger(index) && index >= 0 ? meetings[index] : null;
+    const optionLabel =
+      (selectedOption.text && selectedOption.text.text) || null;
+
+    delegations.push({
+      id: `calmove-${Date.now()}`,
+      type: "calendar_move",
+      meeting_title: (meeting && meeting.title) || optionLabel,
+      meeting_start: (meeting && meeting.start) || null,
+      meeting_organizer: (meeting && meeting.organizer) || null,
+      meeting_link: (meeting && meeting.link) || null,
+      requested_change: details && details.value ? String(details.value).trim() : null,
+      clickedAt: new Date().toISOString(),
+      status: "pending",
+    });
+    saveDelegations();
+    return;
+  }
+
   // --- Message shortcut: "Add to Triage" ---------------------------------
   // A message shortcut payload (type "message_action") has no `actions`
   // array and no message to update - just queue a "triage_add" entry.
@@ -710,7 +913,14 @@ async function processInteraction(payload) {
   // hourly sweep like every other type), the Gmail archive runs inline, and
   // both best-effort re-publish the Home view. Returns false for every other
   // action_id, leaving all handling below untouched.
-  if (await handleExtraAction(action, payload, { delegations, saveDelegations, republishHomeView })) {
+  if (
+    await handleExtraAction(action, payload, {
+      delegations,
+      saveDelegations,
+      republishHomeView,
+      openMeetingMoveModal,
+    })
+  ) {
     return;
   }
 
@@ -739,6 +949,14 @@ async function processInteraction(payload) {
       status: "pending",
     });
     saveDelegations();
+
+    // ✅ means "done or no longer needed" — record it in the completions log
+    // (GET /state/completions) so the brief generator stops resurfacing it.
+    appendCompletion({
+      id: task.taskId !== undefined ? task.taskId : null,
+      text: task.text || "",
+      source: task.source || "manual",
+    });
 
     const view = payload.view;
     const userId = payload.user && payload.user.id;
@@ -1037,7 +1255,8 @@ async function processInteraction(payload) {
   // `brief_refresh_queued`, a no-op the unknown-action branch below
   // ignores, so the same message can't queue twice. The 🎙️ link button is
   // preserved untouched. Home-tab clicks have no response_url (and no
-  // message), so they just enqueue. /delegations/complete only targets
+  // message), so they enqueue and then best-effort re-publish the Home view
+  // with the same button rewrite. /delegations/complete only targets
   // `rec_text_<id>` section blocks, so it gracefully no-ops on the button
   // row for refresh entries (the entry is still marked).
   if (action.action_id === "brief_refresh") {
@@ -1054,35 +1273,44 @@ async function processInteraction(payload) {
     });
     saveDelegations();
 
+    const markRefreshQueued = (blocks) =>
+      blocks.map((block) => {
+        if (!block || block.block_id !== "voice_actions" || !Array.isArray(block.elements)) {
+          return block;
+        }
+        return {
+          ...block,
+          elements: block.elements.map((el) =>
+            el && el.action_id === "brief_refresh"
+              ? {
+                  ...el,
+                  action_id: "brief_refresh_queued",
+                  text: {
+                    type: "plain_text",
+                    text: "🔄 Queued — runs on the next sweep",
+                    emoji: true,
+                  },
+                }
+              : el
+          ),
+        };
+      });
+
     const responseUrl = payload.response_url;
     const originalBlocks = payload.message && payload.message.blocks;
-    if (!responseUrl || !Array.isArray(originalBlocks) || originalBlocks.length === 0) {
-      return; // Home-tab click (or no message context): enqueue only.
+    if (responseUrl && Array.isArray(originalBlocks) && originalBlocks.length > 0) {
+      await postResponseUrlUpdate(responseUrl, markRefreshQueued(originalBlocks), "brief_refresh");
+      return;
     }
 
-    const newBlocks = originalBlocks.map((block) => {
-      if (!block || block.block_id !== "voice_actions" || !Array.isArray(block.elements)) {
-        return block;
-      }
-      return {
-        ...block,
-        elements: block.elements.map((el) =>
-          el && el.action_id === "brief_refresh"
-            ? {
-                ...el,
-                action_id: "brief_refresh_queued",
-                text: {
-                  type: "plain_text",
-                  text: "🔄 Queued — runs on the next sweep",
-                  emoji: true,
-                },
-              }
-            : el
-        ),
-      };
-    });
-
-    await postResponseUrlUpdate(responseUrl, newBlocks, "brief_refresh");
+    // Home-tab click: no response_url, so the feedback is a best-effort
+    // views.publish with the same button rewrite — the click no longer looks
+    // like it did nothing.
+    const view = payload.view;
+    const userId = payload.user && payload.user.id;
+    if (view && view.type === "home" && Array.isArray(view.blocks) && userId) {
+      await republishHomeView(userId, markRefreshQueued(view.blocks), "brief_refresh");
+    }
     return;
   }
 
@@ -1329,6 +1557,12 @@ async function processInteraction(payload) {
     });
     saveDelegations();
 
+    // ✅ Done also lands in the completions log (GET /state/completions) so
+    // the brief generator stops resurfacing the item. Final — no follow-up.
+    if (!isArchive) {
+      appendCompletion({ id: value.id || null, text: value.text || "", source: "brief_section" });
+    }
+
     const responseUrl = payload.response_url;
     const originalBlocks = payload.message && payload.message.blocks;
     if (!responseUrl || !Array.isArray(originalBlocks) || originalBlocks.length === 0) {
@@ -1444,7 +1678,19 @@ async function processInteraction(payload) {
       console.error("sec_item_view_draft click carried an unparseable value - ignoring");
       return;
     }
-    const draft = typeof value.draft === "string" ? value.draft : "";
+    // Current buttons carry just a `draft_id` and the FULL text is read back
+    // from the drafts store (no more ~1900-char truncation inside the button
+    // value); legacy messages still carry the inline `draft` and keep
+    // working.
+    let draft = typeof value.draft === "string" ? value.draft : "";
+    if (!draft && typeof value.draft_id === "string" && value.draft_id) {
+      const stored = (draftsStore.get() || {}).items;
+      const entry = stored && stored[value.draft_id];
+      draft =
+        entry && typeof entry.text === "string" && entry.text
+          ? entry.text
+          : "(draft no longer on file — ask for a fresh brief to regenerate it)";
+    }
     if (!draft || !payload.trigger_id) {
       console.error("sec_item_view_draft click had no draft/trigger_id - ignoring");
       return;
@@ -1468,13 +1714,22 @@ async function processInteraction(payload) {
             title: { type: "plain_text", text: "Draft", emoji: true },
             close: { type: "plain_text", text: "Close", emoji: true },
             blocks: [
-              {
-                type: "section",
-                text: {
-                  type: "mrkdwn",
-                  text: `\`\`\`${escaped.slice(0, MAX_SECTION_TEXT - 6)}\`\`\``,
-                },
-              },
+              // Long drafts are split across section blocks (each capped by
+              // Slack's 3000-char section limit) instead of being cut off.
+              ...(() => {
+                const chunkSize = MAX_SECTION_TEXT - 6; // room for the ``` fences
+                const chunks = [];
+                for (let i = 0; i < escaped.length && chunks.length < 40; i += chunkSize) {
+                  chunks.push({
+                    type: "section",
+                    text: {
+                      type: "mrkdwn",
+                      text: `\`\`\`${escaped.slice(i, i + chunkSize)}\`\`\``,
+                    },
+                  });
+                }
+                return chunks;
+              })(),
               {
                 type: "context",
                 elements: [
@@ -1536,13 +1791,14 @@ async function processInteraction(payload) {
     }
   });
 
+  const acted = items.find((item) => item && item.id === actedId);
+
   // "🤖 Do it": push the clicked item onto the delegation queue (link
   // recovered from the message's accessory URLs above), regardless of
   // whether the message update below succeeds. `channel`/`message_ts`
   // identify the original brief message so /delegations/complete can later
   // strike the item out in place.
   if (action.action_id === "item_delegate") {
-    const acted = items.find((item) => item && item.id === actedId);
     delegations.push({
       id: crypto.randomUUID(),
       type: "calendar",
@@ -1557,13 +1813,48 @@ async function processInteraction(payload) {
     saveDelegations();
   }
 
+  // "✅": record the completion (GET /state/completions) so the brief
+  // generator stops resurfacing the item. A ✅ means "done or no longer
+  // needed" — final, nothing follows up on it. The strikethrough re-render
+  // below is unchanged.
+  if (action.action_id === "item_done") {
+    appendCompletion({
+      id: actedId,
+      text: acted && acted.text ? acted.text : "",
+      source: "brief",
+    });
+  }
+
+  const newItems = applyAction(items, actedId, action.action_id);
+
+  // "🔼"/"🔽": reorders are a PRIORITY SIGNAL, not just cosmetics — persist
+  // the post-click ordering plus which item was explicitly moved, so the
+  // external brief generator (GET /state/priorities) respects it on the
+  // next render. Runs before the response_url guard: the signal is durable
+  // even when the visual update can't happen.
+  if (action.action_id === "item_up" || action.action_id === "item_down") {
+    const previous = prioritiesStore.get() || {};
+    const now = new Date().toISOString();
+    prioritiesStore.set({
+      updatedAt: now,
+      order: newItems
+        .filter(Boolean)
+        .map((item) => ({ id: item.id, text: item.text || "", done: !!item.done })),
+      overrides: {
+        ...(previous.overrides && typeof previous.overrides === "object"
+          ? previous.overrides
+          : {}),
+        [actedId]: { action: action.action_id, at: now },
+      },
+    });
+  }
+
   const responseUrl = payload.response_url;
   if (!responseUrl) {
     console.error("block_actions payload had no response_url; cannot update message");
     return;
   }
 
-  const newItems = applyAction(items, actedId, action.action_id);
   const newRecsBlocks = buildRecommendationsBlocks(newItems);
   const newBlocks = mergeUpdatedBlocks(originalBlocks, newRecsBlocks);
 
@@ -1794,6 +2085,69 @@ app.post("/delegations/complete", requireInternalSecret, express.json(), async (
   } catch (err) {
     console.error("Error updating original message for /delegations/complete:", err);
     return res.status(502).json({ ok: false, error: "slack_request_failed" });
+  }
+});
+
+// ---------------------------------------------------------------------------
+// GET /state/priorities
+//
+// Returns the persisted 🔼/🔽 priority signal:
+// { ok, updatedAt, order: [{id, text, done}], overrides: {<id>: {action, at}} }
+// — `order` is the full ordering after the latest reorder click, `overrides`
+// records which items Gustavo explicitly moved (and how). The external brief
+// generator reads this before POSTing /render-brief so his ordering is
+// respected. Protected by the same X-Internal-Secret header as /render-brief.
+// ---------------------------------------------------------------------------
+app.get("/state/priorities", requireInternalSecret, (req, res) => {
+  const state = prioritiesStore.get() || {};
+  res.json({
+    ok: true,
+    updatedAt: state.updatedAt || null,
+    order: Array.isArray(state.order) ? state.order : [],
+    overrides: state.overrides && typeof state.overrides === "object" ? state.overrides : {},
+  });
+});
+
+// ---------------------------------------------------------------------------
+// GET /state/completions
+//
+// Returns the completions log — every done-style click (item_done /
+// urgent_done / task_complete), newest last:
+// { ok, items: [{id, text, source, clickedAt}] }. A logged ✅ is final
+// ("done or no longer needed"); consumers should stop resurfacing the item,
+// never verify or nag. Protected by the same X-Internal-Secret header as
+// /render-brief.
+// ---------------------------------------------------------------------------
+app.get("/state/completions", requireInternalSecret, (req, res) => {
+  const state = completionsStore.get() || {};
+  res.json({ ok: true, items: Array.isArray(state.items) ? state.items : [] });
+});
+
+// ---------------------------------------------------------------------------
+// POST /drafts
+//
+// Draft-only delivery (see src/drafts.js — nothing is EVER sent as Gustavo):
+//   { kind: "email", to, subject?, text? | context? } → a real Gmail draft
+//     (users.drafts.create) plus an "Open in Gmail Drafts" link, surfaced in
+//     the CoS channel when COS_CHANNEL is set. Needs the Gmail env vars.
+//   { kind: "slack", channel?, to?, text? | context? } → the ready-to-paste
+//     text posted BY THE BOT to the CoS channel (COS_CHANNEL) in a code
+//     block, with a deep link to the target conversation. Needs COS_CHANNEL.
+// When `text` is omitted, the draft is generated via src/ai.js (needs
+// ANTHROPIC_API_KEY + ANTHROPIC_MODEL). Protected by the same
+// X-Internal-Secret header as /render-brief.
+// ---------------------------------------------------------------------------
+app.post("/drafts", requireInternalSecret, express.json({ limit: RENDER_BODY_LIMIT }), async (req, res) => {
+  try {
+    const result = await deliverDraft(req.body || {});
+    if (result.ok) {
+      return res.json(result);
+    }
+    const { status, ...body } = result;
+    return res.status(status || 400).json(body);
+  } catch (err) {
+    console.error("Error delivering draft:", err);
+    return res.status(502).json({ ok: false, error: "draft_delivery_failed" });
   }
 });
 
