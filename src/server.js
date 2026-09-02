@@ -82,6 +82,10 @@ const SLACK_API_BASE = process.env.SLACK_API_BASE || "https://slack.com/api";
 //                     clickedAt, status, channel, message_ts }
 //   - "dismiss"       (✖️ Not for me on an actionable section item OR a
 //                     brief recommendation): shaped like "snooze" minus due
+//   - "schedule_focus" (🧠 Head-down time on an actionable section item -
+//                     asks the assistant to schedule a focus block for the
+//                     task): shaped like "snooze" (id, text, link, due,
+//                     clickedAt, status, channel, message_ts)
 //   - "calendar_block" (📅 Home-tab Calendar quick actions): shaped
 //                     { id: "calblock-<ms>", type, duration_minutes, day
 //                     ("today"|"tomorrow"), when ("now"|null), title,
@@ -1428,6 +1432,66 @@ async function processInteraction(payload) {
     return;
   }
 
+  // --- Actionable section items: 🧠 Head-down time --------------------------
+  // Button in the `sec_item_actions_<id>` row under each actionable section
+  // item (see blocks.js). The value carries {id, type, due?, text, link?}.
+  // Queue a "schedule_focus" delegation entry asking the assistant to
+  // schedule a focus block for the task, then rewrite JUST this button via
+  // response_url: its text becomes "🧠 Queued" and its action_id is swapped
+  // to `sec_item_focus_queued`, a no-op the unknown-action branch below
+  // ignores, so the same item can't queue twice. Unlike snooze/dismiss the
+  // item is NOT marked handled - its text, accessory and sibling buttons all
+  // stay, since booking focus time doesn't complete the task.
+  if (action.action_id === "sec_item_focus") {
+    let value;
+    try {
+      value = JSON.parse(action.value);
+    } catch (err) {
+      console.error("sec_item_focus click carried an unparseable value - ignoring");
+      return;
+    }
+
+    delegations.push({
+      id: value.id || `focus-${Date.now()}`,
+      type: "schedule_focus",
+      text: value.text || "",
+      link: value.link || null,
+      due: value.due || null,
+      clickedAt: new Date().toISOString(),
+      status: "pending",
+      channel: (payload.channel && payload.channel.id) || null,
+      message_ts: (payload.message && payload.message.ts) || null,
+    });
+    saveDelegations();
+
+    const responseUrl = payload.response_url;
+    const originalBlocks = payload.message && payload.message.blocks;
+    if (!responseUrl || !Array.isArray(originalBlocks) || originalBlocks.length === 0) {
+      return;
+    }
+
+    const newBlocks = originalBlocks.map((block) => {
+      if (!block || block.block_id !== action.block_id || !Array.isArray(block.elements)) {
+        return block;
+      }
+      return {
+        ...block,
+        elements: block.elements.map((el) =>
+          el && el.action_id === "sec_item_focus"
+            ? {
+                ...el,
+                action_id: "sec_item_focus_queued",
+                text: { type: "plain_text", text: "🧠 Queued", emoji: true },
+              }
+            : el
+        ),
+      };
+    });
+
+    await postResponseUrlUpdate(responseUrl, newBlocks, "sec_item_focus");
+    return;
+  }
+
   // --- "📝 View draft" ------------------------------------------------------
   // Accessory on draft-carrying section items (e.g. the Delegated section's
   // ready-to-send nudges) and in the ⏰/✖️ row of actionable items. Opens a
@@ -1576,8 +1640,8 @@ async function processInteraction(payload) {
 // Returns every delegation-queue entry still awaiting an ack:
 // { items: [{ id, type, ..., clickedAt, status: "pending" }] } where `type`
 // is "calendar" | "task_complete" | "bot_do" | "triage_add" |
-// "archive_email" | "urgent_done" | "snooze" | "dismiss" | "refresh" |
-// "gmail_zero_start" | "slack_zero_start" | "calendar_block" |
+// "archive_email" | "urgent_done" | "snooze" | "dismiss" | "schedule_focus" |
+// "refresh" | "gmail_zero_start" | "slack_zero_start" | "calendar_block" |
 // "calendar_move" (see the queue comment at
 // the top of this file for per-type fields). Entries queued before the
 // `type` field existed are reported as "calendar" so consumers can always

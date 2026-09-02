@@ -28,9 +28,11 @@
  *          "archive_email" → "🗑️ Archive" (action_id `sec_item_archive`),
  *          "done" → "✅ Done" (action_id `sec_item_done`) - plus an actions
  *          row (block_id `sec_item_actions_<id>`) holding "⏰ Snooze"
- *          (`sec_item_snooze`, value carries `due` when set) and "✖️ Not for
- *          me" (`sec_item_dismiss`), and a "📝 View draft" button when the
- *          item carries a `draft` string. Button values are compact JSON
+ *          (`sec_item_snooze`, value carries `due` when set), "✖️ Not for
+ *          me" (`sec_item_dismiss`) and "🧠 Head-down time"
+ *          (`sec_item_focus`, value carries `due` like snooze), and a
+ *          "📝 View draft" button when the item carries a `draft` string.
+ *          Button values are compact JSON
  *          {id, type, gmail_thread_id?, due?, text (truncated), link?}.
  *        - DRAFT items ({text, link?, draft}, no action) render as their own
  *          section block with a "📝 View draft" accessory button (action_id
@@ -391,11 +393,14 @@ function buildSecItemValue(item, type, extra) {
  *      the compact JSON above (plus gmail_thread_id for archives);
  *   2. an actions row (block_id `sec_item_actions_<id>`) with "⏰ Snooze"
  *      (action_id `sec_item_snooze`, value carries the item's optional `due`
- *      date) and "✖️ Not for me" (action_id `sec_item_dismiss`) - clicking
- *      queues a "snooze" / "dismiss" delegation entry and marks the item in
- *      place. When the item also carries a `draft` string, a "📝 View draft"
- *      button (action_id `sec_item_view_draft`) is appended - it opens a
- *      modal showing the draft, display-only (see buildDraftButton).
+ *      date), "✖️ Not for me" (action_id `sec_item_dismiss`) and "🧠
+ *      Head-down time" (action_id `sec_item_focus`, value carries `due` like
+ *      snooze) - clicking queues a "snooze" / "dismiss" / "schedule_focus"
+ *      delegation entry (snooze/dismiss also mark the item in place; focus
+ *      just swaps its own button to a queued no-op - the item stays
+ *      actionable). When the item also carries a `draft` string, a "📝 View
+ *      draft" button (action_id `sec_item_view_draft`) is appended - it
+ *      opens a modal showing the draft, display-only (see buildDraftButton).
  *
  * @param {{text: string, link?: string, id?: string, due?: string, draft?: string, action: {type: string, gmail_thread_id?: string}}} item
  * @returns {Array<object>} [section block, actions block]
@@ -427,18 +432,18 @@ function buildActionItemBlocks(item) {
 }
 
 /**
- * Builds the ⏰ Snooze / ✖️ Not for me actions row for one section item (see
- * buildActionItemBlocks). The snooze value additionally carries the item's
- * `due` date (truncated, optional); a `draft` string appends a "📝 View
- * draft" button.
+ * Builds the ⏰ Snooze / ✖️ Not for me / 🧠 Head-down time actions row for
+ * one section item (see buildActionItemBlocks). The snooze and focus values
+ * additionally carry the item's `due` date (truncated, optional); a `draft`
+ * string appends a "📝 View draft" button.
  *
  * @param {{text: string, link?: string, id?: string, due?: string, draft?: string}} item
  * @returns {object} Slack Block Kit `actions` block
  */
 function buildSecItemExtrasBlock(item) {
-  const snoozeExtra = {};
+  const dueExtra = {};
   if (typeof item.due === "string" && item.due) {
-    snoozeExtra.due = truncate(item.due, SEC_ITEM_VALUE_DUE_MAX);
+    dueExtra.due = truncate(item.due, SEC_ITEM_VALUE_DUE_MAX);
   }
 
   const elements = [
@@ -446,13 +451,19 @@ function buildSecItemExtrasBlock(item) {
       type: "button",
       action_id: "sec_item_snooze",
       text: { type: "plain_text", text: "⏰ Snooze", emoji: true },
-      value: buildSecItemValue(item, "snooze", snoozeExtra),
+      value: buildSecItemValue(item, "snooze", dueExtra),
     },
     {
       type: "button",
       action_id: "sec_item_dismiss",
       text: { type: "plain_text", text: "✖️ Not for me", emoji: true },
       value: buildSecItemValue(item, "dismiss"),
+    },
+    {
+      type: "button",
+      action_id: "sec_item_focus",
+      text: { type: "plain_text", text: "🧠 Head-down time", emoji: true },
+      value: buildSecItemValue(item, "schedule_focus", dueExtra),
     },
   ];
 
